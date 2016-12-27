@@ -1,17 +1,21 @@
+import boto3.session
 import click
-import re
 
 from .error_handling import HandleExceptions
-
-REGION_PATTERN = re.compile(r'^[a-z]{2}-[a-z]+-[0-9]$')
 
 
 def validate_region(ctx, param, value):
     """Validate Click region param parameter."""
+
     if value is not None:
-        if not REGION_PATTERN.match(value):
-            raise click.BadParameter("'{}'. Region must be a valid "
-                                     "AWS region.".format(value))
+        session = boto3.session.Session()
+        valid_regions = session.get_available_regions('cloudformation')
+        if value not in valid_regions:
+            valid_regions.sort()
+            raise click.BadParameter("'{}'. Region must be one of the "
+                                     "following AWS regions:\n"
+                                     "  - {}".format(value,
+                                                     "\n  - ".join(valid_regions)))
     return value
 
 
@@ -54,3 +58,4 @@ watchrefresh_option = click.option('-w', '--watch',
                                    type=click.IntRange(1, 300),
                                    metavar='SECS',
                                    help='Auto update the screen every X seconds')
+GLOBAL_OPTIONS = {}

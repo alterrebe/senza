@@ -4,9 +4,9 @@ from copy import deepcopy
 from enum import Enum
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
-import boto3
 from click import confirm
 
+from .boto_proxy import BotoClientProxy
 from .exceptions import (ELBNotFound, HostedZoneNotFound, InvalidState,
                          RecordNotFound)
 
@@ -93,7 +93,7 @@ class Route53HostedZone:
 
     def change(self,
                changes: Iterable[Tuple[str, "Route53Record"]],
-               comment: Optional[str] = None) -> Dict[str, Any]:
+               comment: Optional[str]=None) -> Dict[str, Any]:
         """
         Submits changes to Route53. Returns the dict sent to
         AWS.
@@ -102,7 +102,7 @@ class Route53HostedZone:
         http://boto3.readthedocs.io/en/latest/reference/services/route53.html#Route53.Client.change_resource_record_sets
         """
 
-        client = boto3.client('route53')
+        client = BotoClientProxy('route53')
 
         change_batch = {'Changes': []}
         if comment is not None:
@@ -120,7 +120,7 @@ class Route53HostedZone:
 
     def create(self,
                changed_records: Iterable["Route53Record"],
-               comment: Optional[str] = None) -> Dict[str, Any]:
+               comment: Optional[str]=None) -> Dict[str, Any]:
         """
         Submits changes to be created in Route53. Returns the dict sent to
         AWS.
@@ -135,7 +135,7 @@ class Route53HostedZone:
 
     def delete(self,
                changed_records: Iterable["Route53Record"],
-               comment: Optional[str] = None) -> Dict[str, Any]:
+               comment: Optional[str]=None) -> Dict[str, Any]:
         """
         Submits changes to be deleted in Route53. Returns the dict sent to
         AWS.
@@ -195,7 +195,8 @@ class Route53Record:
         self.geo_location = geo_location  # Geo location resource record sets only
         self.health_check_id = health_check_id  # Health Check resource record sets only
         self.region = region  # Latency-based resource record sets only
-        self.set_identifier = set_identifier  # Weighted, Latency, Geo, and Failover resource record sets only
+        # Weighted, Latency, Geo, and Failover resource record sets only
+        self.set_identifier = set_identifier
         self.traffic_policy_instance_id = traffic_policy_instance_id
         self.weight = weight  # Weighted resource record sets only
 
@@ -243,7 +244,7 @@ class Route53Record:
     @classmethod
     def from_boto_dict(cls,
                        record_dict: Dict[str, Any],
-                       hosted_zone: Optional["Route53HostedZone"] = None) -> 'Route53Record':
+                       hosted_zone: Optional["Route53HostedZone"]=None) -> 'Route53Record':
         """
         Returns a Route53Record based on the dict returned by boto3
         """
@@ -281,7 +282,7 @@ class Route53Record:
         if self.alias_target is not None:
             # Record is already an Alias
             return deepcopy(self)
-        elif self.type == RecordType.CNAME:
+        if self.type == RecordType.CNAME:
             dns_name = self.resource_records[0]['Value']
             # dns name looks like lb-name-123456.aws-region-1.elb.amazonaws.com
             sub_domain, _ = dns_name.split('.', maxsplit=1)  # type: str
@@ -310,7 +311,7 @@ class Route53Record:
 class Route53:
 
     def __init__(self):
-        self.client = boto3.client('route53')
+        self.client = BotoClientProxy('route53')
 
     @staticmethod
     def get_hosted_zones(domain_name: Optional[str]=None,
@@ -323,7 +324,7 @@ class Route53:
         if domain_name is not None:
             domain_name = '{}.'.format(domain_name.rstrip('.'))
 
-        client = boto3.client('route53')
+        client = BotoClientProxy('route53')
         result = client.list_hosted_zones()
         hosted_zones = result["HostedZones"]
         while result.get('IsTruncated', False):
@@ -345,13 +346,26 @@ class Route53:
     @classmethod
     def get_records(cls, *,
                     name: Optional[str]=None) -> Iterator[Route53Record]:
-        client = boto3.client('route53')
+        client = BotoClientProxy('route53')
         if name is not None and not name.endswith('.'):
             name += '.'
         for zone in cls.get_hosted_zones():
-            # TODO use paginator
             response = client.list_resource_record_sets(HostedZoneId=zone.id)
             resources = response["ResourceRecordSets"]  # type: List[Dict[str, Any]]
+
+            # If the response includes more than maxitems resource record sets,
+            # the value of the IsTruncated element in the response is true,
+            # and the values of the NextRecordName and NextRecordType elements
+            # in the response identify the first resource record set in the
+            # next group of maxitems resource record sets.
+            while response.get('IsTruncated', False):
+                next_name = response['NextRecordName']
+                next_type = response['NextRecordType']
+                response = client.list_resource_record_sets(HostedZoneId=zone.id,
+                                                            StartRecordName=next_name,
+                                                            StartRecordType=next_type)
+                resources.extend(response['ResourceRecordSets'])
+
             for resource in resources:
                 record = Route53Record.from_boto_dict(resource,
                                                       hosted_zone=zone)
@@ -360,12 +374,12 @@ class Route53:
                 yield record
 
 
-def convert_domain_records_to_alias(domain_name: str):
+def convert_cname_records_to_alias(domain_name: str):
     records = Route53.get_records(name=domain_name)
     converted_records = defaultdict(lambda: {'delete': [],
                                              'upsert': []})
     for record in records:
-        if record.type != 'A':
+        if record.type == RecordType.CNAME:
             converted_records[record.hosted_zone]['delete'].append(record)
             try:
                 alias_record = record.to_alias()

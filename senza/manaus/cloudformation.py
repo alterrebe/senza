@@ -1,17 +1,32 @@
+"""
+CloudFormation_ related classes and functions.
+
+For more information see the `CloudFormation documentation`_ and the
+`boto3 documentation`_
+
+.. _CloudFormation: https://aws.amazon.com/cloudformation/
+.. _CloudFormation documentation: https://aws.amazon.com/documentation/cloudformation/
+.. _boto3 documentation:
+    http://boto3.readthedocs.io/en/latest/reference/services/cloudformation.html
+"""
+
 import json
 from collections import OrderedDict
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Iterator, List, Optional
 
-import boto3
 from botocore.exceptions import ClientError
 
+from .boto_proxy import BotoClientProxy
 from .exceptions import StackNotFound, StackNotUpdated
 from .route53 import Route53
 
 
 class ResourceType(str, Enum):
+    """
+    Possible AWS resource types (still incomplete)
+    """
     route53_record_set = 'AWS::Route53::RecordSet'
 
 
@@ -67,6 +82,10 @@ class CloudFormationStack:
     def from_boto_dict(cls,
                        stack: Dict,
                        region: Optional[str]=None) -> "CloudFormationStack":
+        """
+        Converts the dict returned by ``boto3.client.describe_stacks`` to a
+        ``CloudFormationStack`` instance.
+        """
         stack_id = stack['StackId']
         name = stack['StackName']
         description = stack.get('Description')
@@ -98,7 +117,7 @@ class CloudFormationStack:
         See:
         http://boto3.readthedocs.io/en/latest/reference/services/cloudformation.html#CloudFormation.Client.describe_stacks
         """
-        client = boto3.client('cloudformation', region)
+        client = BotoClientProxy('cloudformation', region)
 
         try:
             stacks = client.describe_stacks(StackName=name)
@@ -118,14 +137,25 @@ class CloudFormationStack:
 
     @property
     def resources(self) -> Iterator:
-        client = boto3.client('cloudformation', self.region)
+        """
+        Returns the stack resources as Manaus Objects
+        """
+        client = BotoClientProxy('cloudformation', self.region)
         response = client.list_stack_resources(StackName=self.stack_id)
         resources = response['StackResourceSummaries']  # type: List[Dict]
         for resource in resources:
             resource_type = resource["ResourceType"]
             if resource_type == ResourceType.route53_record_set:
+                physical_resource_id = resource.get('PhysicalResourceId')
+                if physical_resource_id is None:
+                    # if there is no Physical Resource Id we can't fetch the
+                    # record
+                    continue
                 records = Route53.get_records(name=resource['PhysicalResourceId'])
-                yield next(records)
+                for record in records:
+                    if (record.set_identifier is None or
+                            record.set_identifier == self.name):
+                        yield record
             else:  # pragma: no cover
                 # TODO implement the other resource types
                 # Ignore resources that are still not implemented in manaus
@@ -133,20 +163,28 @@ class CloudFormationStack:
 
     @property
     def template(self) -> Dict:
+        """
+        Fetches the template json for the stack and caches it locally - reset
+        with CloudFormationStack.reset().
+        """
         if self.__template is None:
-            client = boto3.client('cloudformation', self.region)
+            client = BotoClientProxy('cloudformation', self.region)
             response = client.get_template(StackName=self.name)
             self.__template = response['TemplateBody']
         return self.__template
 
     def reset(self):
+        """
+        Resets the locally stored template
+        :return:
+        """
         self.__template = None
 
     def update(self):
         """
         Sends the current template to CloudFormation to update the stack
         """
-        client = boto3.client('cloudformation', self.region)
+        client = BotoClientProxy('cloudformation', self.region)
         parameters = [{'ParameterKey': key, 'ParameterValue': value}
                       for key, value in self.parameters.items()]
         try:
@@ -163,15 +201,32 @@ class CloudFormationStack:
             else:
                 raise
 
+    def delete(self):
+        """
+        Delete the CloudFormation stack
+        """
+        client = BotoClientProxy('cloudformation', self.region)
+        client.delete_stack(StackName=self.stack_id)
+
 
 class CloudFormation:
+    """
+    Represents the CloudFormation service.
 
-    def __init__(self, region: Optional[str] = None):
+    See:
+    http://boto3.readthedocs.io/en/latest/reference/services/cloudformation.html
+    """
+    def __init__(self, region: Optional[str]=None):
         self.region = region
 
-    def get_stacks(self, all: bool=False):
-        client = boto3.client('cloudformation', self.region)
-        if all:
+    def get_stacks(self,
+                   all_stacks: bool=False) -> Iterator[CloudFormationStack]:
+        """
+        Gets CloudFormation stacks from aws. If all_stacks is ``True`` it will
+        also include deleted stacks
+        """
+        client = BotoClientProxy('cloudformation', self.region)
+        if all_stacks:
             status_filter = []
         else:
             # status_filter = [st for st in cf.valid_states if st != 'DELETE_COMPLETE']

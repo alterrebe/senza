@@ -1,7 +1,13 @@
+import builtins
+import importlib
 from unittest.mock import MagicMock
+
+import botocore.exceptions
+import senza.traffic
 from senza.aws import SenzaStackSummary
-from senza.traffic import get_stack_versions, StackVersion, get_weights, resolve_to_ip_addresses
 from senza.manaus.route53 import RecordType
+from senza.traffic import (StackVersion, get_stack_versions, get_weights,
+                           resolve_to_ip_addresses)
 
 
 def test_get_stack_versions(monkeypatch):
@@ -38,7 +44,20 @@ def test_get_stack_versions(monkeypatch):
         return_value=[SenzaStackSummary(stack), SenzaStackSummary({'StackStatus': 'ROLLBACK_COMPLETE',
                                                                    'StackName': 'my-stack-1'})]))
     stack_version = list(get_stack_versions('my-stack', 'my-region'))
-    assert stack_version == [StackVersion('my-stack', '1', ['myapp.example.org'], ['elb-dns-name'], ['some-arn'])]
+    assert stack_version == [StackVersion('my-stack', '1',
+                                          ['myapp.example.org'],
+                                          ['elb-dns-name'],
+                                          ['some-arn'])]
+
+    elb.describe_load_balancers.side_effect = botocore.exceptions.ClientError(
+        {'Error': {'Code': 'LoadBalancerNotFound'}},
+        'foobar'
+    )
+    stack_version = list(get_stack_versions('my-stack', 'my-region'))
+    assert stack_version == [StackVersion('my-stack', '1',
+                                          ['myapp.example.org'],
+                                          [],
+                                          ['some-arn'])]
 
 
 def test_get_weights(monkeypatch):
@@ -83,3 +102,22 @@ def test_resolve_to_ip_addresses(monkeypatch):
     query.side_effect = None
     query.return_value = [MagicMock(address='1.2.3.4')]
     assert resolve_to_ip_addresses('example.org') == {'1.2.3.4'}
+
+
+def test_dns_import(monkeypatch):
+    realimport = builtins.__import__
+
+    def fake_import(name: str, *args, **kwargs):
+        if name == 'dns':
+            raise ImportError()
+        else:
+            m = realimport(name, *args, **kwargs)
+            return m
+
+    monkeypatch.setattr(builtins, '__import__', fake_import)
+    m_fatal_error = MagicMock()
+    monkeypatch.setattr('clickclick.fatal_error', m_fatal_error)
+    importlib.reload(senza.traffic)
+    m_fatal_error.assert_called_once_with("Failed to import dns.resolver.\n"
+                                          "Run 'pip3 install -U "
+                                          "--force-reinstall dnspython'.")

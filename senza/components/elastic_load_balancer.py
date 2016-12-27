@@ -1,15 +1,18 @@
 import click
 from clickclick import fatal_error
 from senza.aws import resolve_security_groups
+from senza.definitions import AccountArguments
 
-from ..cli import AccountArguments, TemplateArguments
+from ..cli import TemplateArguments
 from ..manaus import ClientError
 from ..manaus.acm import ACM, ACMCertificate
 from ..manaus.iam import IAM, IAMServerCertificate
-from ..manaus.route53 import convert_domain_records_to_alias
+from ..manaus.route53 import convert_cname_records_to_alias
 
 SENZA_PROPERTIES = frozenset(['Domains', 'HealthCheckPath', 'HealthCheckPort', 'HealthCheckProtocol',
                               'HTTPPort', 'Name', 'SecurityGroups', 'SSLCertificateId', 'Type'])
+ALLOWED_HEALTH_CHECK_PROTOCOLS = frozenset(["HTTP", "TCP", "UDP", "SSL"])
+ALLOWED_LOADBALANCER_SCHEMES = frozenset(["internet-facing", "internal"])
 
 
 def get_load_balancer_name(stack_name: str, stack_version: str):
@@ -22,8 +25,7 @@ def get_load_balancer_name(stack_name: str, stack_version: str):
     return '{}-{}'.format(stack_name[:l], stack_version)
 
 
-def get_listeners(subdomain, main_zone, configuration,
-                  account_info: AccountArguments):
+def get_ssl_cert(subdomain, main_zone, configuration, account_info: AccountArguments):
     ssl_cert = configuration.get('SSLCertificateId')
 
     if ACMCertificate.arn_is_acm_certificate(ssl_cert):
@@ -70,15 +72,30 @@ def get_listeners(subdomain, main_zone, configuration,
                             'SSL certificate for "{}"'.format(name))
             else:
                 fatal_error('Could not find any SSL certificate')
+
+    return ssl_cert
+
+
+def get_listeners(configuration):
     return [
         {
             "PolicyNames": [],
-            "SSLCertificateId": ssl_cert,
+            "SSLCertificateId": configuration.get('SSLCertificateId'),
             "Protocol": "HTTPS",
             "InstancePort": configuration["HTTPPort"],
             "LoadBalancerPort": 443
         }
     ]
+
+
+def resolve_ssl_certificates(listeners, subdomain, main_zone, account_info):
+    new_listeners = []
+    for listener in listeners:
+        if listener.get('Protocol') in ('HTTPS', 'SSL'):
+            ssl_cert = get_ssl_cert(subdomain, main_zone, listener, account_info)
+            listener['SSLCertificateId'] = ssl_cert
+        new_listeners.append(listener)
+    return new_listeners
 
 
 def component_elastic_load_balancer(definition,
@@ -96,7 +113,7 @@ def component_elastic_load_balancer(definition,
 
         domain_name = "{0}.{1}".format(domain["Subdomain"], domain["Zone"])
 
-        convert_domain_records_to_alias(domain_name)
+        convert_cname_records_to_alias(domain_name)
 
         properties = {"Type": "A",
                       "Name": domain_name,
@@ -114,23 +131,16 @@ def component_elastic_load_balancer(definition,
             subdomain = domain['Subdomain']
             main_zone = domain['Zone']  # type: str
 
-    listeners = configuration.get('Listeners') or get_listeners(subdomain, main_zone, configuration, account_info)
+    listeners = configuration.get('Listeners') or get_listeners(configuration)
+    listeners = resolve_ssl_certificates(listeners, subdomain, main_zone, account_info)
 
-    health_check_protocol = "HTTP"
-    allowed_health_check_protocols = ("HTTP", "TCP", "UDP", "SSL")
-    if "HealthCheckProtocol" in configuration:
-        health_check_protocol = configuration["HealthCheckProtocol"]
+    health_check_protocol = configuration.get('HealthCheckProtocol') or 'HTTP'
 
-    if health_check_protocol not in allowed_health_check_protocols:
+    if health_check_protocol not in ALLOWED_HEALTH_CHECK_PROTOCOLS:
         raise click.UsageError('Protocol "{}" is not supported for LoadBalancer'.format(health_check_protocol))
 
-    health_check_path = "/ui/"
-    if "HealthCheckPath" in configuration:
-        health_check_path = configuration["HealthCheckPath"]
-
-    health_check_port = configuration["HTTPPort"]
-    if "HealthCheckPort" in configuration:
-        health_check_port = configuration["HealthCheckPort"]
+    health_check_path = configuration.get("HealthCheckPath") or '/health'
+    health_check_port = configuration.get("HealthCheckPort") or configuration["HTTPPort"]
 
     health_check_target = "{0}:{1}{2}".format(health_check_protocol,
                                               health_check_port,
@@ -145,19 +155,14 @@ def component_elastic_load_balancer(definition,
         loadbalancer_name = get_load_balancer_name(info["StackName"],
                                                    info["StackVersion"])
 
-    loadbalancer_scheme = "internal"
-    allowed_loadbalancer_schemes = ("internet-facing", "internal")
-    if "Scheme" in configuration:
-        loadbalancer_scheme = configuration["Scheme"]
-    else:
-        configuration["Scheme"] = loadbalancer_scheme
+    loadbalancer_scheme = configuration.get('Scheme') or 'internal'
 
     if loadbalancer_scheme == 'internet-facing':
         click.secho('You are deploying an internet-facing ELB that will be '
                     'publicly accessible! You should have OAUTH2 and HTTPS '
                     'in place!', bold=True, err=True)
 
-    if loadbalancer_scheme not in allowed_loadbalancer_schemes:
+    if loadbalancer_scheme not in ALLOWED_LOADBALANCER_SCHEMES:
         raise click.UsageError('Scheme "{}" is not supported for LoadBalancer'.format(loadbalancer_scheme))
 
     if loadbalancer_scheme == "internal":
@@ -169,6 +174,7 @@ def component_elastic_load_balancer(definition,
     definition["Resources"][lb_name] = {
         "Type": "AWS::ElasticLoadBalancing::LoadBalancer",
         "Properties": {
+            "Scheme": loadbalancer_scheme,
             "Subnets": {"Fn::FindInMap": [loadbalancer_subnet_map, {"Ref": "AWS::Region"}, "Subnets"]},
             "HealthCheck": {
                 "HealthyThreshold": "2",

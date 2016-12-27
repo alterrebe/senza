@@ -1,3 +1,8 @@
+"""
+Exceptions to be raised by Manaus components
+"""
+
+
 class ManausException(Exception):
     """
     Base class for Manaus exceptions
@@ -9,6 +14,9 @@ class InvalidState(ManausException):
     Exception raised when executing an action would try to change a stack
     to an invalid state
     """
+
+    def __init__(self, reason: str):
+        super().__init__('Invalid State: {}'.format(reason))
 
 
 class ELBNotFound(ManausException):

@@ -18,37 +18,38 @@ from urllib.request import urlopen
 import boto3
 import click
 import requests
-import senza
 import yaml
 from botocore.exceptions import ClientError
-from clickclick import (Action, AliasedGroup, FloatRange, OutputFormat, choice,
-                        error, fatal_error, info, ok)
+from clickclick import (Action, FloatRange, OutputFormat, choice, error,
+                        fatal_error, info, ok)
 from clickclick.console import print_table
+from senza.definitions import AccountArguments
 
-from .arguments import (json_output_option, output_option,
+from .arguments import (GLOBAL_OPTIONS, json_output_option, output_option,
                         parameter_file_option, region_option,
                         stacktrace_visible_option, watch_option,
                         watchrefresh_option)
-from .aws import (StackReference, get_account_alias, get_account_id,
-                  get_required_capabilities, get_stacks, get_tag, matches_any,
-                  parse_time, resolve_topic_arn)
+from .aws import (StackReference, get_required_capabilities, get_stacks,
+                  get_tag, matches_any, parse_time, resolve_topic_arn)
 from .components import evaluate_template, get_component
 from .components.stups_auto_configuration import find_taupage_image
 from .error_handling import HandleExceptions
-from .manaus.ec2 import EC2
+from .exceptions import InvalidDefinition
+from .manaus.boto_proxy import BotoClientProxy
+from .manaus.cloudformation import CloudFormation
 from .manaus.exceptions import VPCError
 from .manaus.route53 import Route53, Route53Record
+from .manaus.utils import extract_client_error_code
 from .patch import patch_auto_scaling_group
 from .respawn import get_auto_scaling_group, respawn_auto_scaling_group
 from .stups.piu import Piu
+from .subcommands.config import cmd_config
+from .subcommands.root import cli
 from .templates import get_template_description, get_templates
-from .templates._helper import get_mint_bucket_name
 from .traffic import (change_version_traffic, get_records,
                       print_version_traffic, resolve_to_ip_addresses)
 from .utils import (camel_case_to_underscore, ensure_keys, named_value,
                     pystache_render)
-
-CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
 
 STYLES = {
     'RUNNING': {'fg': 'green'},
@@ -74,6 +75,7 @@ STYLES = {
     'UPDATE_FAILED': {'fg': 'red'},
     'UPDATE_ROLLBACK_COMPLETE': {'fg': 'red'},
     'IN_SERVICE': {'fg': 'green'},
+    'HEALTHY': {'fg': 'green'},
     'OUT_OF_SERVICE': {'fg': 'red'},
     'OK': {'fg': 'green'},
     'ERROR': {'fg': 'red'},
@@ -114,8 +116,6 @@ MAX_COLUMN_WIDTHS = {
     'ResourceStatusReason': 50
 }
 
-GLOBAL_OPTIONS = {}
-
 
 def print_json(data, output=None):
     if output == 'yaml':
@@ -136,7 +136,11 @@ class DefinitionParamType(click.ParamType):
                 #     url = 'file://{}'.format(quote(os.path.abspath(value)))
 
                 response = urlopen(url)
-                data = yaml.safe_load(response.read())
+                try:
+                    data = yaml.safe_load(response.read())
+                except yaml.YAMLError as e:
+                    raise InvalidDefinition(path=value,
+                                            reason=str(e))
             except URLError:
                 self.fail('"{}" not found'.format(value), param, ctx)
         else:
@@ -198,13 +202,6 @@ BASE_TEMPLATE = {
 }
 
 
-def print_version(ctx, param, value):
-    if not value or ctx.resilient_parsing:
-        return
-    click.echo('Senza {}'.format(senza.__version__))
-    ctx.exit()
-
-
 def evaluate(definition, args, account_info, force: bool):
     # extract Senza* meta information
     info = definition.pop("SenzaInfo")
@@ -248,103 +245,10 @@ def evaluate(definition, args, account_info, force: bool):
     return definition
 
 
-@click.group(cls=AliasedGroup, context_settings=CONTEXT_SETTINGS)
-@click.option('-V', '--version', is_flag=True, callback=print_version, expose_value=False, is_eager=True,
-              help='Print the current version number and exit.')
-@region_option
-def cli(region):
-    GLOBAL_OPTIONS['region'] = region
-
-
 class TemplateArguments:
     def __init__(self, **kwargs):
         for key, val in kwargs.items():
             setattr(self, key, val)
-
-
-class AccountArguments:
-    """
-    Account arguments to use in the definitions
-    """
-    def __init__(self, region):
-        self.Region = region
-        self.__AccountAlias = None
-        self.__AccountID = None
-        self.__Domain = None
-        self.__MintBucket = None
-        self.__TeamID = None
-        self.__VpcID = None
-
-    @property
-    def AccountID(self):
-        if self.__AccountID is None:
-            self.__AccountID = get_account_id()
-        return self.__AccountID
-
-    @property
-    def AccountAlias(self):
-        if self.__AccountAlias is None:
-            self.__AccountAlias = get_account_alias()
-        return self.__AccountAlias
-
-    @property
-    def Domain(self) -> str:
-        if self.__Domain is None:
-            self.__setDomain()
-        return self.__Domain.rstrip('.')
-
-    def __setDomain(self, domain_name=None):
-        domain_list = list(Route53.get_hosted_zones(domain_name))
-        if len(domain_list) == 0:
-            raise AttributeError('No Domain configured')
-        elif len(domain_list) > 1:
-            domain = choice('Please select the domain',
-                            sorted(domain.domain_name
-                                   for domain in domain_list))
-        else:
-            domain = domain_list[0].domain_name
-        self.__Domain = domain
-        return domain
-
-    def split_domain(self, domain_name):
-        self.__setDomain(domain_name)
-        if domain_name.endswith('.{}'.format(self.Domain)):
-            return domain_name[:-len('.{}'.format(self.Domain))], self.Domain
-        else:
-            # default behaviour for unknown domains
-            return domain_name.split('.', 1)
-
-    @property
-    def TeamID(self):
-        if self.__TeamID is None:
-            self.__TeamID = self.AccountAlias.split('-', maxsplit=1)[-1]
-        return self.__TeamID
-
-    @property
-    def VpcID(self):
-        if self.__VpcID is None:
-            ec2 = EC2(self.Region)
-            try:
-                vpc = ec2.get_default_vpc()
-            except VPCError as error:
-                if sys.stdin.isatty() and error.number_of_vpcs:
-                    # if running in interactive terminal and there are VPCs
-                    # to choose from
-                    vpcs = ec2.get_all_vpcs()
-                    options = [(vpc.vpc_id, str(vpc)) for vpc in vpcs]
-                    print("Can't find a default VPC")
-                    vpc = choice("Select VPC to use",
-                                 options=options)
-                else:  # if not running in interactive terminal (e.g Jenkins)
-                    raise
-            self.__VpcID = vpc.vpc_id
-        return self.__VpcID
-
-    @property
-    def MintBucket(self):
-        if self.__MintBucket is None:
-            self.__MintBucket = get_mint_bucket_name(self.Region)
-        return self.__MintBucket
 
 
 def parse_args(input, region, version, parameter, account_info):
@@ -428,17 +332,14 @@ def get_region(region):
             pass
 
     if not region:
-        raise click.UsageError('Please specify the AWS region on the command line (--region) or in ~/.aws/config')
+        raise click.UsageError('Please specify the AWS region on the '
+                               'command line (--region) or in ~/.aws/config')
 
-    # FIXME bool(boto3.client('cloudformation', 'moon-1')) == True
-    cf = boto3.client('cloudformation', region)
-    if not cf:
-        raise click.UsageError('Invalid region "{}"'.format(region))
     return region
 
 
 def check_credentials(region):
-    iam = boto3.client('iam')
+    iam = BotoClientProxy('iam')
     return iam.list_account_aliases()
 
 
@@ -459,8 +360,21 @@ def get_stack_refs(refs: list):
         else:
             try:
                 with open(ref) as fd:
-                    data = yaml.safe_load(fd)
-                ref = data['SenzaInfo']['StackName']
+                    try:
+                        data = yaml.safe_load(fd)
+                    except yaml.YAMLError as e:
+                        raise InvalidDefinition(path=ref,
+                                                reason=str(e))
+
+                try:
+                    ref = data['SenzaInfo']['StackName']
+                except KeyError:
+                    raise InvalidDefinition(path=ref,
+                                            reason="SenzaInfo is missing "
+                                                   "or invalid")
+                except TypeError:
+                    raise InvalidDefinition(path=ref,
+                                            reason="Invalid SenzaInfo")
             except (OSError, IOError):
                 # It's still possible that the ref is a regex
                 pass
@@ -516,6 +430,79 @@ def list_stacks(region, stack_ref, all, output, w, watch):
                         styles=STYLES, titles=TITLES)
 
 
+def get_application_load_balancer_metrics(cloudwatch, alb_id, start, now):
+    alb_metrics = {
+        'TargetResponseTime': 'Average', 'RequestCount': 'Sum',
+        'HTTPCode_Target_5XX_Count': 'Sum', 'HTTPCode_Target_4XX_Count': 'Sum'}
+    row = {}
+    data = {}
+    for k, v in alb_metrics.items():
+        res = cloudwatch.get_metric_statistics(
+            Namespace='AWS/ApplicationELB',
+            MetricName=k,
+            Dimensions=[{'Name': 'LoadBalancer', 'Value': alb_id}],
+            StartTime=start,
+            EndTime=now,
+            Period=60,
+            Statistics=[v])
+        # NOTE: we get the most recent two (!) datapoints as the newest point might be incomplete
+        most_recent = sorted(res['Datapoints'], key=lambda x: x['Timestamp'])[-2:]
+        if most_recent:
+            data[(k, v)] = most_recent[0][v]
+        else:
+            data[(k, v)] = None
+    if data[('RequestCount', 'Sum')] is not None:
+        requests_per_min = data[('RequestCount', 'Sum')]
+        row['requests_per_sec'] = round(requests_per_min / 60, 2)
+    else:
+        requests_per_min = 0
+    if data[('HTTPCode_Target_4XX_Count', 'Sum')] is not None:
+        row['4xx_percentage'] = round((data[('HTTPCode_Target_4XX_Count', 'Sum')]) /
+                                      (requests_per_min + 0.0001), 2)
+    if data[('HTTPCode_Target_5XX_Count', 'Sum')] is not None:
+        row['5xx_percentage'] = round((data[('HTTPCode_Target_5XX_Count', 'Sum')]) /
+                                      (requests_per_min + 0.0001), 2)
+    if data[('TargetResponseTime', 'Average')] is not None:
+        row['latency_ms'] = int(round((data[('TargetResponseTime', 'Average')]) * 1000, 0))
+    return row
+
+
+def get_classic_load_balancer_metrics(cloudwatch, lb_name, start, now):
+    elb_metrics = {
+        'Latency': 'Average', 'RequestCount': 'Sum',
+        'HTTPCode_Backend_5XX': 'Sum', 'HTTPCode_Backend_4XX': 'Sum'}
+    row = {}
+    data = {}
+    for k, v in elb_metrics.items():
+        res = cloudwatch.get_metric_statistics(
+            Namespace='AWS/ELB',
+            MetricName=k,
+            Dimensions=[{'Name': 'LoadBalancerName', 'Value': lb_name}],
+            StartTime=start,
+            EndTime=now,
+            Period=60,
+            Statistics=[v])
+        most_recent = sorted(res['Datapoints'], key=lambda x: x['Timestamp'])[-1:]
+        if most_recent:
+            data[(k, v)] = most_recent[0][v]
+        else:
+            data[(k, v)] = None
+    if data[('RequestCount', 'Sum')] is not None:
+        requests_per_min = data[('RequestCount', 'Sum')]
+        row['requests_per_sec'] = round(requests_per_min / 60, 2)
+    else:
+        requests_per_min = 0
+    if data[('HTTPCode_Backend_4XX', 'Sum')] is not None:
+        row['4xx_percentage'] = round((data[('HTTPCode_Backend_4XX', 'Sum')]) /
+                                      (requests_per_min + 0.0001), 2)
+    if data[('HTTPCode_Backend_5XX', 'Sum')] is not None:
+        row['5xx_percentage'] = round((data[('HTTPCode_Backend_5XX', 'Sum')]) /
+                                      (requests_per_min + 0.0001), 2)
+    if data[('Latency', 'Average')] is not None:
+        row['latency_ms'] = int(round((data[('Latency', 'Average')]) * 1000, 0))
+    return row
+
+
 @cli.command()
 @region_option
 @output_option
@@ -530,54 +517,36 @@ def health(region, stack_ref, all, output, w, watch):
     region = get_region(region)
     check_credentials(region)
 
-    cloudwatch = boto3.client('cloudwatch', region)
+    cloudwatch = BotoClientProxy('cloudwatch', region)
 
     stack_refs = get_stack_refs(stack_ref)
-
-    elb_metrics = {
-        'HealthyHostCount': 'Average', 'Latency': 'Average', 'RequestCount': 'Sum',
-        'HTTPCode_Backend_5XX': 'Sum', 'HTTPCode_Backend_4XX': 'Sum'}
 
     for _ in watching(w, watch):
         rows = []
         start = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
         now = datetime.datetime.utcnow()
+        paginator = cloudwatch.get_paginator('list_metrics')
+        alb_ids = {}
+        for page in paginator.paginate(Namespace='AWS/ApplicationELB', MetricName='RequestCount',
+                                       Dimensions=[{'Name': 'LoadBalancer'}]):
+            for metric in page['Metrics']:
+                alb_id = ''.join([d['Value'] for d in metric['Dimensions'] if d['Name'] == 'LoadBalancer'])
+                alb_ids[alb_id.split('/')[1]] = alb_id
         for stack in get_stacks(stack_refs, region, all=all):
             lb_name = stack.StackName
-            data = {}
-            for k, v in elb_metrics.items():
-                res = cloudwatch.get_metric_statistics(
-                    Namespace='AWS/ELB',
-                    MetricName=k,
-                    Dimensions=[{'Name': 'LoadBalancerName', 'Value': lb_name}],
-                    StartTime=start,
-                    EndTime=now,
-                    Period=60,
-                    Statistics=[v])
-                most_recent = sorted(res['Datapoints'], key=lambda x: x['Timestamp'])[-1:]
-                if most_recent:
-                    data[(k, v)] = most_recent[0][v]
-                else:
-                    data[(k, v)] = None
+            instance_health = get_instance_health(lb_name, region)
             row = {
                 'stack_name': stack.name,
                 'version': stack.version,
                 'status': stack.StackStatus,
+                'healthy_hosts': get_healthy_instances(instance_health),
                 'creation_time': calendar.timegm(stack.CreationTime.timetuple()),
             }
-            if data[('HealthyHostCount', 'Average')] is not None:
-                row['healthy_hosts'] = int(data[('HealthyHostCount', 'Average')])
-            if data[('RequestCount', 'Sum')] is not None:
-                requests_per_min = data[('RequestCount', 'Sum')]
-                row['requests_per_sec'] = round(requests_per_min / 60, 2)
+            alb_id = alb_ids.get(lb_name)
+            if alb_id:
+                row.update(get_application_load_balancer_metrics(cloudwatch, alb_id, start, now))
             else:
-                requests_per_min = 0
-            if data[('HTTPCode_Backend_4XX', 'Sum')] is not None:
-                row['4xx_percentage'] = round((data[('HTTPCode_Backend_4XX', 'Sum')]) / (requests_per_min + 0.0001), 2)
-            if data[('HTTPCode_Backend_5XX', 'Sum')] is not None:
-                row['5xx_percentage'] = round((data[('HTTPCode_Backend_5XX', 'Sum')]) / (requests_per_min + 0.0001), 2)
-            if data[('Latency', 'Average')] is not None:
-                row['latency_ms'] = int(round((data[('Latency', 'Average')]) * 1000, 0))
+                row.update(get_classic_load_balancer_metrics(cloudwatch, lb_name, start, now))
             rows.append(row)
 
         rows.sort(key=lambda x: (x['stack_name'], x['version']))
@@ -613,7 +582,7 @@ def create(definition, region, version, parameter, disable_rollback, dry_run,
             fatal_error('Invalid tag {}. Tags should be in the form of key=value'.format(tag_kv))
         data['Tags'].append({'Key': key, 'Value': value})
 
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
 
     with Action('Creating Cloud Formation stack {}..'.format(data['StackName'])) as act:
         try:
@@ -623,7 +592,7 @@ def create(definition, region, version, parameter, disable_rollback, dry_run,
             else:
                 cf.create_stack(DisableRollback=disable_rollback, **data)
         except ClientError as e:
-            if e.response['Error']['Code'] == 'AlreadyExistsException':
+            if extract_client_error_code(e) == 'AlreadyExistsException':
                 act.fatal_error('Stack {} already exists. Please choose another version.'.format(data['StackName']))
             else:
                 raise
@@ -645,7 +614,7 @@ def update(definition, region, version, parameter, disable_rollback, dry_run,
 
     region = get_region(region)
     data = create_cf_template(definition, region, version, parameter, force, parameter_file)
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
 
     with Action('Updating Cloud Formation stack {}..'.format(data['StackName'])) as act:
         try:
@@ -672,11 +641,11 @@ def print_cfjson(definition, region, version, parameter, output, force,
     '''Print the generated Cloud Formation template'''
 
     region = get_region(region)
-    data = create_cf_template(definition, region, version, parameter, force, parameter_file)
+    data = create_cf_template(definition, region, version, parameter, force, parameter_file, pretty=True)
     print_json(data['TemplateBody'], output)
 
 
-def create_cf_template(definition, region, version, parameter, force, parameter_file):
+def create_cf_template(definition, region, version, parameter, force, parameter_file, pretty=False):
     region = get_region(region)
     if parameter_file:
         parameter_from_file = read_parameter_file(parameter_file)
@@ -732,7 +701,10 @@ def create_cf_template(definition, region, version, parameter, force, parameter_
         topics = []
 
     capabilities = get_required_capabilities(data)
-    cfjson = json.dumps(data, sort_keys=True, indent=4)
+    if pretty:
+        cfjson = json.dumps(data, sort_keys=True, indent=4)
+    else:
+        cfjson = json.dumps(data, separators=(',', ':'))
     return {'StackName': stack_name, 'TemplateBody': cfjson, 'Parameters': parameters, 'Tags': tags_list,
             'NotificationARNs': topics, 'Capabilities': capabilities}
 
@@ -740,9 +712,12 @@ def create_cf_template(definition, region, version, parameter, force, parameter_
 @cli.command()
 @click.argument('stack_ref', nargs=-1)
 @region_option
-@click.option('--dry-run', is_flag=True, help='No-op mode: show what would be deleted')
-@click.option('-g', '--ignore-non-existent', is_flag=True, help='Do not show error when stack does not exist')
-@click.option('-f', '--force', is_flag=True, help='Allow deleting multiple stacks')
+@click.option('--dry-run', is_flag=True,
+              help='No-op mode: show what would be deleted')
+@click.option('-g', '--ignore-non-existent', is_flag=True,
+              help='Do not show error when stack does not exist')
+@click.option('-f', '--force', is_flag=True,
+              help='Allow deleting multiple stacks and stacks with traffic')
 @click.option('-i', '--interactive', is_flag=True,
               help='Prompt before every deletion')
 @stacktrace_visible_option
@@ -752,27 +727,40 @@ def delete(stack_ref, region, dry_run, force, interactive, ignore_non_existent):
     stack_refs = get_stack_refs(stack_ref)
     region = get_region(region)
     check_credentials(region)
-    cf = boto3.client('cloudformation', region)
 
     if not stack_refs:
         raise click.UsageError('Please specify at least one stack')
 
-    stacks = list(get_stacks(stack_refs, region))
+    cf = CloudFormation(region=region)
+    stacks = [stack
+              for stack in cf.get_stacks()
+              if matches_any(stack.name, stack_refs)]
 
-    if not all_with_version(stack_refs) and len(stacks) > 1 and not dry_run and not force:
+    if (not all_with_version(stack_refs) and len(stacks) > 1 and
+            not dry_run and not force):
         fatal_error('Error: {} matching stacks found. '.format(len(stacks)) +
-                    'Please use the "--force" flag if you really want to delete multiple stacks.')
+                    'Please use the "--force" flag if you really want to '
+                    'delete multiple stacks.')
 
     if not stacks and not ignore_non_existent:
         fatal_error('Error: Stack {} not found!'.format(stack_refs[0].name))
 
     for stack in stacks:
-        if interactive and not click.confirm("Delete '{}'?".format(stack.StackName)):
+
+        for r in stack.resources:
+            if isinstance(r, Route53Record):
+                has_traffic = r.weight is not None and r.weight
+                if has_traffic and not force:
+                    fatal_error('Error: Stack {} has traffic!\n'
+                                'Use --force if you really want '
+                                'to delete it'.format(stack.name))
+
+        if interactive and not click.confirm("Delete '{}'?".format(stack.name)):
             continue
 
-        with Action('Deleting Cloud Formation stack {}..'.format(stack.StackName)):
+        with Action('Deleting Cloud Formation stack {}..'.format(stack.name)):
             if not dry_run:
-                cf.delete_stack(StackName=stack.StackName)
+                stack.delete()
 
 
 def format_resource_type(resource_type):
@@ -794,7 +782,7 @@ def resources(stack_ref, region, w, watch, output):
     stack_refs = get_stack_refs(stack_ref)
     region = get_region(region)
     check_credentials(region)
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
 
     for _ in watching(w, watch):
         rows = []
@@ -829,7 +817,7 @@ def events(stack_ref, region, w, watch, output):
     stack_refs = get_stack_refs(stack_ref)
     region = get_region(region)
     check_credentials(region)
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
 
     for _ in watching(w, watch):
         rows = []
@@ -887,21 +875,43 @@ def init(definition_file, region, template, user_variable):
         definition_file.write(definition)
 
 
-def get_instance_health(elb, stack_name: str) -> dict:
+def get_instance_health(stack_name: str, region: str) -> dict:
     if stack_name is None:
         return {}
     instance_health = {}
+    elb = BotoClientProxy('elb', region)
     try:
         instance_states = elb.describe_instance_health(LoadBalancerName=stack_name)['InstanceStates']
         for istate in instance_states:
             instance_health[istate['InstanceId']] = camel_case_to_underscore(istate['State']).upper()
     except ClientError as e:
-        # ignore non existing ELBs
+        # retry with ELBv2
+        error_code = extract_client_error_code(e)
+        if error_code == 'LoadBalancerNotFound':
+            elbv2 = BotoClientProxy('elbv2', region)
+            try:
+                response = elbv2.describe_target_groups(Names=[stack_name])
+                for tg in response['TargetGroups']:
+                    response = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
+                    for target_health in response['TargetHealthDescriptions']:
+                        instance_health[target_health['Target']['Id']] = \
+                            camel_case_to_underscore(target_health['TargetHealth']['State']).upper()
+            except ClientError as e:
+                inner_error_code = extract_client_error_code(e)
+                if inner_error_code not in ('TargetGroupNotFound', 'ValidationError', 'Throttling'):
+                    raise
         # ignore ValidationError "LoadBalancer name cannot be longer than 32 characters"
         # ignore rate limit exceeded errors
-        if e.response['Error']['Code'] not in ('LoadBalancerNotFound', 'ValidationError', 'Throttling'):
+        elif error_code not in ('ValidationError', 'Throttling'):
             raise
     return instance_health
+
+
+def get_healthy_instances(instance_health: dict) -> int:
+    if not instance_health:
+        # if we have no instances at all -> treat as "unknown"
+        return None
+    return len([i for i in instance_health.values() if i in ('IN_SERVICE', 'HEALTHY')])
 
 
 def get_instance_user_data(instance) -> dict:
@@ -942,7 +952,6 @@ def instances(stack_ref, all, terminated, docker_image, piu, odd_host, region,
     check_credentials(region)
 
     ec2 = boto3.resource('ec2', region)
-    elb = boto3.client('elb', region)
 
     if all:
         filters = []
@@ -960,7 +969,7 @@ def instances(stack_ref, all, terminated, docker_image, piu, odd_host, region,
             stack_name = get_tag(instance.tags, 'StackName')
             stack_version = get_tag(instance.tags, 'StackVersion')
             if not stack_refs or matches_any(cf_stack_name, stack_refs):
-                instance_health = get_instance_health(elb, cf_stack_name)
+                instance_health = get_instance_health(cf_stack_name, region)
                 if instance.state['Name'].upper() != 'TERMINATED' or terminated:
 
                     docker_source = get_instance_docker_image_source(instance) if docker_image else ''
@@ -985,11 +994,13 @@ def instances(stack_ref, all, terminated, docker_image, piu, odd_host, region,
 
         if piu is not None:
             odd_host = odd_host or Piu.find_odd_host(region)
+            auto_connect = len(rows) == 1
             for row in rows:
                 if row['private_ip'] is not None:
                     Piu.request_access(instance=row['private_ip'],
                                        reason=piu,
-                                       odd_host=odd_host)
+                                       odd_host=odd_host,
+                                       connect=auto_connect)
 
 
 @cli.command()
@@ -1007,13 +1018,12 @@ def status(stack_ref, region, output, w, watch):
     check_credentials(region)
 
     ec2 = boto3.resource('ec2', region)
-    elb = boto3.client('elb', region)
     cf = boto3.resource('cloudformation', region)
 
     for _ in watching(w, watch):
         rows = []
         for stack in sorted(get_stacks(stack_refs, region)):
-            instance_health = get_instance_health(elb, stack.StackName)
+            instance_health = get_instance_health(stack.StackName, region)
 
             main_dns_resolves = None
             version_addresses = set()
@@ -1048,7 +1058,7 @@ def status(stack_ref, region, output, w, watch):
                          'status': stack.StackStatus,
                          'total_instances': len(instances),
                          'running_instances': len([i for i in instances if i.state['Name'] == 'running']),
-                         'healthy_instances': len([i for i in instance_health.values() if i == 'IN_SERVICE']),
+                         'healthy_instances': get_healthy_instances(instance_health),
                          'lb_status': ','.join(set(instance_health.values())),
                          'main_dns': main_dns_resolves,
                          'http_status': http_status
@@ -1127,13 +1137,17 @@ def domains(stack_ref, region, output, w, watch):
 @click.argument('stack_name')
 @click.argument('stack_version', required=False)
 @click.argument('percentage', type=FloatRange(0, 100, clamp=True), required=False)
+@click.option('-i', '--interval', default=5,
+              type=click.IntRange(1, 600, clamp=True),
+              help='Time between checks (default: 5s)')
 @region_option
 @output_option
 @stacktrace_visible_option
-def traffic(stack_name, stack_version, percentage, region, output):
-    '''Route traffic to a specific stack (weighted DNS record)'''
+def traffic(stack_name, stack_version, percentage, region, output, interval):
+    """Route traffic to a specific stack (weighted DNS record)"""
 
     stack_refs = get_stack_refs([stack_name, stack_version])
+    related_stack_refs = get_stack_refs([stack_name])
     region = get_region(region)
     check_credentials(region)
 
@@ -1142,6 +1156,30 @@ def traffic(stack_name, stack_version, percentage, region, output):
             if percentage is None:
                 print_version_traffic(ref, region)
             else:
+                all_stacks_in_final_state = False
+                while not all_stacks_in_final_state:
+                    # assume all stacks are ready
+                    all_stacks_in_final_state = True
+                    related_stacks = list(get_stacks(related_stack_refs, region))
+
+                    if len(related_stacks) > 0:
+                        for related_stack in related_stacks:
+                            current_stack_status = related_stack.StackStatus
+
+                            if current_stack_status.endswith('_COMPLETE') or current_stack_status.endswith('_FAILED'):
+                                continue
+                            elif current_stack_status.endswith('_IN_PROGRESS'):
+                                # some operation in progress, let's wait some time to try again
+                                all_stacks_in_final_state = False
+                                info(
+                                    "Waiting for stack {} ({}) to perform traffic change..".format(
+                                        related_stack.StackName, current_stack_status))
+                                time.sleep(interval)
+                    else:
+                        error("Stack not found!")
+                        exit(1)
+
+                # change traffic after all related stacks are in a final state
                 change_version_traffic(ref, percentage, region)
 
 
@@ -1321,7 +1359,7 @@ def dump(stack_ref, region, output):
     region = get_region(region)
     check_credentials(region)
 
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
 
     for stack in get_stacks(stack_refs, region):
         data = cf.get_template(StackName=stack.StackName)['TemplateBody']
@@ -1330,7 +1368,7 @@ def dump(stack_ref, region, output):
 
 
 def get_auto_scaling_groups(stack_refs, region):
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
     for stack in get_stacks(stack_refs, region):
         resources = cf.describe_stack_resources(StackName=stack.StackName)['StackResources']
 
@@ -1373,7 +1411,7 @@ def patch(stack_ref, region, image, instance_type, user_data):
     if not properties:
         raise click.UsageError('Nothing to patch. Please specify at least one patch option (e.g. "--image").')
 
-    asg = boto3.client('autoscaling', region)
+    asg = BotoClientProxy('autoscaling', region)
 
     for asg_name in get_auto_scaling_groups(stack_refs, region):
         with Action('Patching Auto Scaling Group {}..'.format(asg_name)) as act:
@@ -1418,7 +1456,7 @@ def scale(stack_ref, region, desired_capacity):
     region = get_region(region)
     check_credentials(region)
 
-    asg = boto3.client('autoscaling', region)
+    asg = BotoClientProxy('autoscaling', region)
 
     for asg_name in get_auto_scaling_groups(stack_refs, region):
         group = get_auto_scaling_group(asg, asg_name)
@@ -1466,7 +1504,7 @@ def wait(stack_ref, region, deletion, timeout, interval):
 
     stack_refs = get_stack_refs(stack_ref)
     region = get_region(region)
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
 
     target_status = (['DELETE_COMPLETE'] if deletion
                      else ['CREATE_COMPLETE', 'UPDATE_COMPLETE'])
@@ -1522,6 +1560,9 @@ def wait(stack_ref, region, deletion, timeout, interval):
                                                          actions))
             return
     raise click.Abort()
+
+
+cli.add_command(cmd_config)
 
 
 def main():

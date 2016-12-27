@@ -18,3 +18,26 @@ class PiuNotFound(SenzaException, FileNotFoundError):
 
     def __init__(self):
         super().__init__('Command not found: piu')
+
+
+class InvalidConfigKey(SenzaException, ValueError):
+    """
+    Error raised when trying to use an Invalid Config Key
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class InvalidDefinition(SenzaException):
+    """
+    Exception raised when trying to parse and invalid senza definition
+    """
+
+    def __init__(self, path: str, reason: str):
+        self.path = path
+        self.reason = reason
+
+    def __str__(self):
+        return ("{path} is not a valid senza definition: "
+                "{reason}".format_map(vars(self)))

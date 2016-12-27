@@ -4,14 +4,22 @@ from typing import Dict, Iterator
 
 import boto3
 import click
-import dns.resolver
-from clickclick import Action, action, ok, print_table, warning
+from clickclick import Action, action, fatal_error, ok, print_table, warning
 
 from .aws import StackReference, get_stacks, get_tag
-from .manaus.cloudformation import CloudFormationStack
-from .manaus.exceptions import StackNotFound, StackNotUpdated
+from .manaus import ClientError
+from .manaus.boto_proxy import BotoClientProxy
+from .manaus.cloudformation import CloudFormationStack, ResourceType
+from .manaus.exceptions import ELBNotFound, StackNotFound, StackNotUpdated
 from .manaus.route53 import (RecordType, Route53, Route53HostedZone,
-                             convert_domain_records_to_alias)
+                             convert_cname_records_to_alias)
+from .manaus.utils import extract_client_error_code
+
+try:
+    import dns.resolver
+except ImportError:
+    fatal_error("Failed to import dns.resolver.\n"
+                "Run 'pip3 install -U --force-reinstall dnspython'.")
 
 PERCENT_RESOLUTION = 2
 FULL_PERCENTAGE = PERCENT_RESOLUTION * 100
@@ -124,7 +132,7 @@ def set_new_weights(dns_names: list, identifier, lb_dns_name: str,
     for idx, dns_name in enumerate(dns_names):
         domain = dns_name.split('.', 1)[1]
         hosted_zone = Route53HostedZone.get_by_domain_name(domain)
-        convert_domain_records_to_alias(dns_name)
+        convert_cname_records_to_alias(dns_name)
 
         changed = False
         for stack_name, percentage in new_record_weights.items():
@@ -150,12 +158,33 @@ def set_new_weights(dns_names: list, identifier, lb_dns_name: str,
                                                "because traffic for it is 0".format(stack_name))
                 changed = True
                 continue
-            load_balancer = stack.template['Resources']['AppLoadBalancerMainDomain']
-            load_balancer['Properties']['Weight'] = percentage
+
+            for key, resource in stack.template['Resources'].items():
+                if (resource['Type'] == ResourceType.route53_record_set and
+                        resource['Properties']['Name'] == dns_name):
+                    dns_record = stack.template['Resources'][key]
+                    break
+
+            try:
+                dns_record['Properties']['Weight'] = percentage
+            except NameError:
+                raise ELBNotFound(dns_name)
+
             try:
                 stack.update()
             except StackNotUpdated:
-                ...  # it doesn't really matter
+                # make sure we update DNS records which were not updated via CloudFormation
+                record = None
+                for r in Route53.get_records(name=dns_name):
+                    if r.set_identifier == stack_name:
+                        record = r
+                        break
+                if record and record.weight != percentage:
+                    record.weight = percentage
+                    hosted_zone.upsert([record],
+                                       comment="Change weight of {} to {}".format(stack_name,
+                                                                                  percentage))
+                    changed = True
             else:
                 changed = True
 
@@ -231,8 +260,13 @@ def get_stack_versions(stack_name: str, region: str) -> Iterator[StackVersion]:
         notification_arns = details.notification_arns
         for res in details.resource_summaries.all():
             if res.resource_type == 'AWS::ElasticLoadBalancing::LoadBalancer':
-                elb = boto3.client('elb', region)
-                lbs = elb.describe_load_balancers(LoadBalancerNames=[res.physical_resource_id])
+                elb = BotoClientProxy('elb', region)
+                try:
+                    lbs = elb.describe_load_balancers(LoadBalancerNames=[res.physical_resource_id])
+                except ClientError as e:
+                    error_code = extract_client_error_code(e)
+                    if error_code == 'LoadBalancerNotFound':
+                        continue
                 lb_dns_name.append(lbs['LoadBalancerDescriptions'][0]['DNSName'])
             elif res.resource_type == 'AWS::Route53::RecordSet':
                 if 'version' not in res.logical_id.lower():
@@ -251,7 +285,7 @@ def get_records(domain: str):
     domain = '{}.'.format(domain.rstrip('.'))
     if DNS_RR_CACHE.get(domain) is None:
         hosted_zone = Route53HostedZone.get_by_domain_name(domain)
-        route53 = boto3.client('route53')
+        route53 = BotoClientProxy('route53')
         result = route53.list_resource_record_sets(HostedZoneId=hosted_zone.id)
         records = result['ResourceRecordSets']
         while result['IsTruncated']:
@@ -365,7 +399,7 @@ def change_version_traffic(stack_ref: StackReference, percentage: float,
 def inform_sns(arns: list, message: str, region):
     jsonizer = JSONEncoder()
     sns_topics = set(arns)
-    sns = boto3.client('sns', region_name=region)
+    sns = BotoClientProxy('sns', region_name=region)
     for sns_topic in sns_topics:
         sns.publish(TopicArn=sns_topic, Subject="SenzaTrafficRedirect", Message=jsonizer.encode((message)))
 

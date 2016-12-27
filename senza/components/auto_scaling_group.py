@@ -4,6 +4,38 @@ from senza.aws import resolve_security_groups, resolve_topic_arn, resolve_refere
 from senza.utils import ensure_keys
 from senza.components.iam_role import get_merged_policies
 
+# properties evaluated by Senza
+SENZA_PROPERTIES = frozenset(['SecurityGroups', 'Tags'])
+
+# additional CF properties which can be overwritten
+ADDITIONAL_PROPERTIES = {
+    'AWS::AutoScaling::LaunchConfiguration': frozenset(['BlockDeviceMappings', 'IamInstanceProfile', 'SpotPrice']),
+    'AWS::AutoScaling::AutoScalingGroup': frozenset(['MetricsCollection', 'TargetGroupARNs',
+                                                     'TerminationPolicies', 'PlacementGroup'])
+}
+
+
+def create_autoscaling_policy(asg_name, asg_scale_name, asg_scale_adjustment, asg_scale_cooldown, definition):
+    if asg_scale_name not in definition["Resources"]:
+        scaling_policy_def = {
+            "Type": "AWS::AutoScaling::ScalingPolicy",
+            "Properties": {
+                "AdjustmentType": "ChangeInCapacity",
+                "ScalingAdjustment": str(asg_scale_adjustment),
+                "Cooldown": str(asg_scale_cooldown),
+                "AutoScalingGroupName": {
+                    "Ref": asg_name
+                }
+            }
+        }
+    else:
+        scaling_policy_def = definition["Resources"][asg_scale_name]
+        if not scaling_policy_def["Properties"]["AutoScalingGroupName"]["Ref"] == asg_name:
+            raise click.UsageError('Specified ScalingPolicy {} does not reference the '
+                                   'autoscaling group {}'.format(asg_scale_name, asg_name))
+
+    return scaling_policy_def
+
 
 def component_auto_scaling_group(definition, configuration, args, info, force, account_info):
     definition = ensure_keys(definition, "Resources")
@@ -19,10 +51,6 @@ def component_auto_scaling_group(definition, configuration, args, info, force, a
             "EbsOptimized": configuration.get('EbsOptimized', False)
         }
     }
-
-    for key in set(["BlockDeviceMappings", "IamInstanceProfile", "SpotPrice"]):
-        if key in configuration:
-            definition['Resources'][config_name]['Properties'][key] = configuration[key]
 
     if 'IamRoles' in configuration:
         logical_id = configuration['Name'] + 'InstanceProfile'
@@ -150,6 +178,15 @@ def component_auto_scaling_group(definition, configuration, args, info, force, a
             asg_properties["LoadBalancerNames"] = [{'Ref': ref} for ref in configuration["ElasticLoadBalancer"]]
         # use ELB health check by default
         default_health_check_type = 'ELB'
+    if "ElasticLoadBalancerV2" in configuration:
+        if isinstance(configuration["ElasticLoadBalancerV2"], str):
+            asg_properties["TargetGroupARNs"] = [{"Ref": configuration["ElasticLoadBalancerV2"] + 'TargetGroup'}]
+        elif isinstance(configuration["ElasticLoadBalancerV2"], list):
+            asg_properties["TargetGroupARNs"] = [
+                {'Ref': ref} for ref in configuration["ElasticLoadBalancerV2"] + 'TargetGroup'
+            ]
+        # use ELB health check by default
+        default_health_check_type = 'ELB'
 
     asg_properties['HealthCheckType'] = configuration.get('HealthCheckType', default_health_check_type)
     asg_properties['HealthCheckGracePeriod'] = configuration.get('HealthCheckGracePeriod', 300)
@@ -160,32 +197,28 @@ def component_auto_scaling_group(definition, configuration, args, info, force, a
         asg_properties["MinSize"] = as_conf["Minimum"]
         asg_properties["DesiredCapacity"] = max(int(as_conf["Minimum"]), int(as_conf.get('DesiredCapacity', 1)))
 
-        scaling_adjustment = int(as_conf.get("ScalingAdjustment", 1))
+        default_scaling_adjustment = as_conf.get("ScalingAdjustment", 1)
+        default_cooldown = as_conf.get("Cooldown", "60")
+
         # ScaleUp policy
-        definition["Resources"][asg_name + "ScaleUp"] = {
-            "Type": "AWS::AutoScaling::ScalingPolicy",
-            "Properties": {
-                "AdjustmentType": "ChangeInCapacity",
-                "ScalingAdjustment": str(scaling_adjustment),
-                "Cooldown": str(as_conf.get("Cooldown", "60")),
-                "AutoScalingGroupName": {
-                    "Ref": asg_name
-                }
-            }
-        }
+        scale_up_name = asg_name + "ScaleUp"
+        scale_up_adjustment = int(
+            as_conf.get("ScaleUpAdjustment", default_scaling_adjustment))
+        scale_up_cooldown = as_conf.get(
+            "ScaleUpCooldown", default_cooldown)
+
+        definition["Resources"][scale_up_name] = create_autoscaling_policy(
+            asg_name, scale_up_name, scale_up_adjustment, scale_up_cooldown, definition)
 
         # ScaleDown policy
-        definition["Resources"][asg_name + "ScaleDown"] = {
-            "Type": "AWS::AutoScaling::ScalingPolicy",
-            "Properties": {
-                "AdjustmentType": "ChangeInCapacity",
-                "ScalingAdjustment": str((-1) * scaling_adjustment),
-                "Cooldown": str(as_conf.get("Cooldown", "60")),
-                "AutoScalingGroupName": {
-                    "Ref": asg_name
-                }
-            }
-        }
+        scale_down_name = asg_name + "ScaleDown"
+        scale_down_adjustment = (-1) * int(
+            as_conf.get("ScaleDownAdjustment", default_scaling_adjustment))
+        scale_down_cooldown = as_conf.get(
+            "ScaleDownCooldown", default_cooldown)
+
+        definition["Resources"][scale_down_name] = create_autoscaling_policy(
+            asg_name, scale_down_name, scale_down_adjustment, scale_down_cooldown, definition)
 
         if "MetricType" in as_conf:
             metric_type = as_conf["MetricType"]
@@ -203,7 +236,16 @@ def component_auto_scaling_group(definition, configuration, args, info, force, a
         asg_properties["MaxSize"] = 1
         asg_properties["MinSize"] = 1
 
+    for res in (config_name, asg_name):
+        props = definition['Resources'][res]['Properties']
+        additional_cf_properties = ADDITIONAL_PROPERTIES.get(definition['Resources'][res]['Type'])
+        properties_allowed_to_overwrite = (set(props.keys()) - SENZA_PROPERTIES) | additional_cf_properties
+        for key in properties_allowed_to_overwrite:
+            if key in configuration:
+                props[key] = configuration[key]
+
     return definition
+
 
 duration_regex = r'^(?:\d+[hH])?(?:\d+[mM])?(?:\d+[sS])?$'
 duration_split_regex = r'(\d+[hHmMsS])'

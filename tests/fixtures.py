@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -97,6 +97,61 @@ SERVER_CERT_ZO_NE.server_certificate_metadata = {'Arn': 'arn:aws:123',
 @pytest.fixture
 def boto_client(monkeypatch):
     mocks = defaultdict(lambda: MagicMock())
+
+    mocks['cloudformation'] = MagicMock()
+    mocks['cloudformation'].list_stacks.return_value = {'StackSummaries': [
+        {'StackName': 'test-1',
+         'StackId': 'arn:aws:cf:eu-1:test',
+         'CreationTime': '2016-06-14'}]
+    }
+    summary = [{'LastUpdatedTimestamp': datetime(2016, 7, 20, 7, 3, 7,
+                                                 108000,
+                                                 tzinfo=timezone.utc),
+                'LogicalResourceId': 'AppLoadBalancer',
+                'PhysicalResourceId': 'myapp1-1',
+                'ResourceStatus': 'CREATE_COMPLETE',
+                'ResourceType': 'AWS::ElasticLoadBalancing::LoadBalancer'},
+               {'LastUpdatedTimestamp': datetime(2016, 7, 20, 7, 3,
+                                                 45, 70000,
+                                                 tzinfo=timezone.utc),
+                'LogicalResourceId': 'AppLoadBalancerMainDomain',
+                'PhysicalResourceId': 'myapp1.example.com',
+                'ResourceStatus': 'CREATE_COMPLETE',
+                'ResourceType': 'AWS::Route53::RecordSet'},
+               {'LastUpdatedTimestamp': datetime(2016, 7, 20, 7, 3,
+                                                 43, 871000,
+                                                 tzinfo=timezone.utc),
+                'LogicalResourceId': 'AppLoadBalancerVersionDomain',
+                'PhysicalResourceId': 'myapp1-1.example.com',
+                'ResourceStatus': 'CREATE_COMPLETE',
+                'ResourceType': 'AWS::Route53::RecordSet'},
+               {'LastUpdatedTimestamp': datetime(2016, 7, 20, 7, 7,
+                                                 38, 495000,
+                                                 tzinfo=timezone.utc),
+                'LogicalResourceId': 'AppServer',
+                'PhysicalResourceId': 'myapp1-1-AppServer-00000',
+                'ResourceStatus': 'CREATE_COMPLETE',
+                'ResourceType': 'AWS::AutoScaling::AutoScalingGroup'},
+               {'LastUpdatedTimestamp': datetime(2016, 7, 20, 7, 5,
+                                                 10, 48000,
+                                                 tzinfo=timezone.utc),
+                'LogicalResourceId': 'AppServerConfig',
+                'PhysicalResourceId': 'myapp1-1-AppServerConfig-00000',
+                'ResourceStatus': 'CREATE_COMPLETE',
+                'ResourceType': 'AWS::AutoScaling::LaunchConfiguration'},
+               {'LastUpdatedTimestamp': datetime(2016, 7, 20, 7, 5, 6,
+                                                 745000,
+                                                 tzinfo=timezone.utc),
+                'LogicalResourceId': 'AppServerInstanceProfile',
+                'PhysicalResourceId': 'myapp1-1-AppServerInstanceProfile-000',
+                'ResourceStatus': 'CREATE_COMPLETE',
+                'ResourceType': 'AWS::IAM::InstanceProfile'}]
+
+    response = {'ResponseMetadata': {'HTTPStatusCode': 200,
+                                     'RequestId': '0000'},
+                'StackResourceSummaries': summary}
+    mocks['cloudformation'].list_stack_resources.return_value = response
+
     mocks['route53'] = MagicMock()
     mocks['route53'].list_hosted_zones.return_value = {
         'HostedZones': [HOSTED_ZONE_ZO_NE],
@@ -129,9 +184,7 @@ def boto_client(monkeypatch):
         ]}
 
     def my_client(rtype, *args, **kwargs):
-        if rtype == 'route53':
-            return mocks['route53']
-        elif rtype == 'acm':
+        if rtype == 'acm':
             acm = mocks['acm']
             summary_list = {'CertificateSummaryList': [
                 {'CertificateArn': 'arn:aws:acm:eu-west-1:cert1'},
@@ -148,9 +201,23 @@ def boto_client(monkeypatch):
                                         'ResourceType': 'AWS::IAM::Role',
                                         'PhysicalResourceId': 'my-referenced-role'}}
             cf.describe_stack_resource.return_value = resource
-            cf.list_stacks.return_value = {
-                'StackSummaries': [{'StackName': 'test-1',
-                                    'CreationTime': '2016-06-14'}]}
+            cf.describe_stacks.return_value = {
+                'Stacks': [{
+                    'Parameters': [],
+                    'Tags': [],
+                    'StackName': 'test-1',
+                    'CreationTime': datetime(2016, 8, 31, 6, 16, 37, 917000,
+                                             tzinfo=timezone.utc),
+                    'DisableRollback': False,
+                    'Description': 'Test1',
+                    'StackStatus': 'CREATE_COMPLETE',
+                    'NotificationARNs': [],
+                    'StackId': 'arn:aws:cloudformation:eu-central-1:test'}
+                ],
+                'ResponseMetadata': {},
+                'RequestId': 'test'
+            }
+
             return cf
         return mocks[rtype]
 
@@ -213,3 +280,18 @@ def boto_resource(monkeypatch):
         return MagicMock()
 
     monkeypatch.setattr('boto3.resource', my_resource)
+
+
+@pytest.fixture
+def disable_version_check(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr('senza.subcommands.root.check_senza_version', m)
+
+
+@pytest.fixture(autouse=True)
+def valid_regions(monkeypatch):
+    m_session = MagicMock()
+    m_session.return_value = m_session
+    m_session.get_available_regions.return_value = ['aa-fakeregion-1']
+    monkeypatch.setattr('boto3.session.Session', m_session)
+    return m_session

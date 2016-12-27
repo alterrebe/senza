@@ -2,21 +2,31 @@ import collections
 import datetime
 import json
 import os
-from unittest.mock import MagicMock
+from contextlib import contextmanager
+
+from typing import List, Dict
+from typing import Optional
+from unittest.mock import MagicMock, mock_open
 
 import botocore.exceptions
+import pytest
 import senza.traffic
 import yaml
 from click.testing import CliRunner
-from senza.cli import (AccountArguments, KeyValParamType, StackReference,
-                       all_with_version, cli, failure_event,
+from senza.aws import SenzaStackSummary
+from senza.cli import (KeyValParamType, StackReference,
+                       all_with_version, create_cf_template, failure_event,
                        get_console_line_style, get_stack_refs, is_ip_address)
-from senza.manaus.exceptions import StackNotFound, StackNotUpdated
+from senza.definitions import AccountArguments
+from senza.exceptions import InvalidDefinition
+from senza.manaus.exceptions import ELBNotFound, StackNotFound, StackNotUpdated
 from senza.manaus.route53 import RecordType, Route53Record
+from senza.subcommands.root import cli
 from senza.traffic import PERCENT_RESOLUTION, StackVersion
 
-from fixtures import (HOSTED_ZONE_EXAMPLE_NET, HOSTED_ZONE_EXAMPLE_ORG,  # noqa: F401
-                      boto_client, boto_resource)
+from fixtures import (HOSTED_ZONE_EXAMPLE_NET,  # noqa: F401
+                      HOSTED_ZONE_EXAMPLE_ORG, boto_client, boto_resource,
+                      disable_version_check, valid_regions)
 
 
 def test_invalid_definition():
@@ -113,12 +123,6 @@ def test_parameter_file_syntax_error():
     assert 'Error: Error while parsing a flow node' in result.output
 
 
-def test_version():
-    runner = CliRunner()
-    result = runner.invoke(cli, ['--version'])
-    assert result.output.startswith('Senza ')
-
-
 def test_print_minimal(monkeypatch):
     monkeypatch.setattr('boto3.client', lambda *args: MagicMock())
 
@@ -187,7 +191,7 @@ def test_region_validation(monkeypatch):
                                catch_exceptions=False)
 
     assert ('Error: Invalid value for "--region": \'invalid-region\'. '
-            'Region must be a valid AWS region.' in result.output)
+            'Region must be one of the following AWS regions:' in result.output)
 
 
 def test_print_replace_mustache(monkeypatch):
@@ -299,7 +303,7 @@ def test_print_account_info_and_arguments_in_name(monkeypatch):
     assert 'AppImage-dummy-0123456789' in result.output
 
 
-def test_print_auto(monkeypatch, boto_client, boto_resource):  # noqa: F811
+def test_print_auto(monkeypatch, boto_client, boto_resource, disable_version_check):  # noqa: F811
     senza.traffic.DNS_ZONE_CACHE = {}
 
     data = {'SenzaInfo': {'StackName': 'test',
@@ -385,7 +389,7 @@ def test_print_default_value(monkeypatch, boto_client, boto_resource):  # noqa: 
         assert 'ExtraParam: extra value\\n' in result.output
 
 
-def test_print_taupage_config_without_ref(monkeypatch):
+def test_print_taupage_config_without_ref(monkeypatch, disable_version_check):  # noqa: F811
     def my_resource(rtype, *args):
         if rtype == 'ec2':
             ec2 = MagicMock()
@@ -433,7 +437,7 @@ def test_print_taupage_config_without_ref(monkeypatch):
     assert expected_user_data == awsjson["Resources"]["AppServerConfig"]["Properties"]["UserData"]["Fn::Base64"]
 
 
-def test_print_taupage_config_with_ref(monkeypatch):
+def test_print_taupage_config_with_ref(monkeypatch, disable_version_check):  # noqa: F811
     def my_resource(rtype, *args):
         if rtype == 'ec2':
             ec2 = MagicMock()
@@ -455,11 +459,11 @@ def test_print_taupage_config_with_ref(monkeypatch):
                                                                  'source': 'foo/bar',
                                                                  'ports': {80: 80},
                                                                  'mint_bucket': {'Fn::Join':
-                                                                                 ['-',
-                                                                                  [{'Ref': 'bucket1'},
-                                                                                   '{{ Arguments.ApplicationId}}'
-                                                                                   ]
-                                                                                  ]},
+                                                                                     ['-',
+                                                                                      [{'Ref': 'bucket1'},
+                                                                                       '{{ Arguments.ApplicationId}}'
+                                                                                       ]
+                                                                                      ]},
                                                                  'environment': {'ENV1': {'Ref': 'resource1'},
                                                                                  'ENV2': 'v2'}},
                                                'Type': 'Senza::TaupageAutoScalingGroup'}}]
@@ -489,7 +493,7 @@ def test_print_taupage_config_with_ref(monkeypatch):
     assert expected_user_data == awsjson["Resources"]["AppServerConfig"]["Properties"]["UserData"]["Fn::Base64"]
 
 
-def test_dump(monkeypatch):
+def test_dump(monkeypatch, disable_version_check):  # noqa: F811
     cf = MagicMock()
     cf.list_stacks.return_value = {'StackSummaries': [{'StackName': 'mystack-1',
                                                        'CreationTime': '2016-06-14'}]}
@@ -949,23 +953,11 @@ def test_images(monkeypatch):
     assert 'mystack' in result.output
 
 
-def test_delete(monkeypatch):
+def test_delete(monkeypatch, boto_resource, boto_client):  # noqa: F811
 
-    cf = MagicMock()
     stack = {'StackName': 'test-1',
+             'StackId': 'test-1',
              'CreationTime': datetime.datetime.utcnow()}
-    cf.list_stacks.return_value = {'StackSummaries': [stack]}
-
-    def my_resource(rtype, *args):
-        return MagicMock()
-
-    def my_client(rtype, *args):
-        if rtype == 'cloudformation':
-            return cf
-        return MagicMock()
-
-    monkeypatch.setattr('boto3.resource', my_resource)
-    monkeypatch.setattr('boto3.client', my_client)
 
     runner = CliRunner()
 
@@ -978,7 +970,11 @@ def test_delete(monkeypatch):
                                catch_exceptions=False)
         assert 'OK' in result.output
 
-        cf.list_stacks.return_value = {'StackSummaries': [stack, stack]}
+        cf = boto_client['cloudformation']
+        cf.list_stacks.return_value = {
+            'StackSummaries': [stack, stack]
+        }
+
         result = runner.invoke(cli, ['delete', 'myapp.yaml', '--region=aa-fakeregion-1'],
                                catch_exceptions=False)
         assert 'Please use the "--force" flag if you really want to delete multiple stacks' in result.output
@@ -1001,24 +997,7 @@ def test_delete(monkeypatch):
         assert result.exit_code == 0
 
 
-def test_delete_interactive(monkeypatch):
-
-    cf = MagicMock()
-    stack = {'StackName': 'test-1',
-             'CreationTime': datetime.datetime.utcnow()}
-    cf.list_stacks.return_value = {'StackSummaries': [stack]}
-
-    def my_resource(rtype, *args):
-        return MagicMock()
-
-    def my_client(rtype, *args):
-        if rtype == 'cloudformation':
-            return cf
-        return MagicMock()
-
-    monkeypatch.setattr('boto3.resource', my_resource)
-    monkeypatch.setattr('boto3.client', my_client)
-
+def test_delete_interactive(monkeypatch, boto_client, boto_resource):  # noqa: F811
     runner = CliRunner()
 
     data = {'SenzaInfo': {'StackName': 'test'}}
@@ -1040,6 +1019,33 @@ def test_delete_interactive(monkeypatch):
                                catch_exceptions=False)
         assert "Delete 'test-1'" in result.output
         assert "OK" in result.output
+
+
+def test_delete_with_traffic(monkeypatch, boto_resource, boto_client):  # noqa: F811
+
+    runner = CliRunner()
+
+    data = {'SenzaInfo': {'StackName': 'test'}}
+
+    mock_route53 = MagicMock()
+
+    mock_route53.return_value = [MagicMock(spec=Route53Record,
+                                           set_identifier='test-1',
+                                           weight=200)]
+    monkeypatch.setattr('senza.manaus.cloudformation.Route53.get_records',
+                        mock_route53)
+
+    with runner.isolated_filesystem():
+        with open('myapp.yaml', 'w') as fd:
+            yaml.dump(data, fd)
+
+        result = runner.invoke(cli, ['delete', 'myapp.yaml', '--region=aa-fakeregion-1'],
+                               catch_exceptions=False)
+        assert 'Stack test-1 has traffic!' in result.output
+
+        result = runner.invoke(cli, ['delete', 'myapp.yaml', '--region=aa-fakeregion-1', '--force'],
+                               catch_exceptions=False)
+        assert 'OK' in result.output
 
 
 def test_create(monkeypatch):
@@ -1204,7 +1210,6 @@ def test_update(monkeypatch):
 
 
 def test_traffic(monkeypatch, boto_client, boto_resource):  # noqa: F811
-
     stacks = [
         StackVersion('myapp', 'v1', ['myapp.zo.ne'],
                      ['some-lb.eu-central-1.elb.amazonaws.com'], ['some-arn']),
@@ -1217,6 +1222,11 @@ def test_traffic(monkeypatch, boto_client, boto_resource):  # noqa: F811
     ]
     monkeypatch.setattr('senza.traffic.get_stack_versions',
                         MagicMock(return_value=stacks))
+
+    referenced_stacks = [
+        SenzaStackSummary({'StackName': s.name, 'StackStatus': 'UPDATE_COMPLETE'})
+        for s in stacks]
+    monkeypatch.setattr('senza.cli.get_stacks', MagicMock(name="fake_get_stacks", return_value=referenced_stacks))
 
     # start creating mocking of the route53 record sets and Application Versions
     # this is a lot of dirty and nasty code. Please, somebody help this code.
@@ -1272,9 +1282,16 @@ def test_traffic(monkeypatch, boto_client, boto_resource):  # noqa: F811
         assert region == 'aa-fakeregion-1'
         if name not in m_stacks:
             stack = m_stacks[name]
-            resources = {'AppLoadBalancerMainDomain': {'Properties': {'Weight': 20}}}
+            resources = {
+                'AppLoadBalancerMainDomain': {
+                    'Type': 'AWS::Route53::RecordSet',
+                    'Properties': {'Weight': 20,
+                                   'Name': 'myapp.zo.ne.'}
+                }
+            }
             stack.template = {'Resources': resources}
         return m_stacks[name]
+
     m_cfs.get_by_stack_name = get_stack
 
     def get_weight(stack):
@@ -1367,6 +1384,96 @@ def test_traffic(monkeypatch, boto_client, boto_resource):  # noqa: F811
         run(['v3', '10'])
         assert weights() == [0, 0, 20, 180]
 
+    # Test ELB Not found
+
+    def get_stack_no_resources(name, region):
+        assert region == 'aa-fakeregion-1'
+        stack = MagicMock()
+        resources = {}
+        stack.template = {'Resources': resources}
+        return stack
+
+    m_cfs.get_by_stack_name = get_stack_no_resources
+
+    with runner.isolated_filesystem():
+        with pytest.raises(ELBNotFound):
+            run(['v4', '100'])
+
+
+def test_traffic_change_stack_in_progress(monkeypatch, boto_client):  # noqa: F811
+    runner = CliRunner()
+    target_stack_version = 'v1'
+
+    def _run_for_stacks_states_changes(state_progress: List):
+        stacks_state_progress_queue = collections.deque(state_progress)
+
+        def _fake_progress_of_stack_changes(stack_refs, *args, **kwargs) -> List:
+            if stacks_state_progress_queue:
+                return [
+                    SenzaStackSummary({'StackName': 'myapp',
+                                       'StackStatus': stacks_state_progress_queue.popleft()})
+                    for ref in stack_refs]
+            else:
+                return []
+
+        monkeypatch.setattr('senza.cli.get_stacks', _fake_progress_of_stack_changes)
+
+        with runner.isolated_filesystem():
+            sub_command = ['traffic', '--region=aa-fakeregion-1', 'myapp', target_stack_version, '100']
+            return runner.invoke(cli, sub_command, catch_exceptions=False)
+
+    mocked_change_version_traffic = MagicMock(name='mocked_change_version_traffic')
+    monkeypatch.setattr('senza.cli.change_version_traffic', mocked_change_version_traffic)
+
+    mocked_time_sleep = MagicMock(name='mocked_time_sleep')
+    monkeypatch.setattr('senza.cli.time.sleep', mocked_time_sleep)
+
+    @contextmanager
+    def _reset_mocks_ctx():
+        yield
+        mocked_change_version_traffic.reset_mock()
+        mocked_time_sleep.reset_mock()
+
+    # test stack not found
+    with _reset_mocks_ctx():
+        result = _run_for_stacks_states_changes([])
+
+        assert 'Stack not found!' in result.output
+        mocked_change_version_traffic.assert_not_called()
+        mocked_time_sleep.assert_not_called()
+
+    # test stack in progress
+    with _reset_mocks_ctx():
+        result = _run_for_stacks_states_changes(['UPDATE_IN_PROGRESS', 'UPDATE_COMPLETE'])
+
+        assert 'Waiting for stack myapp (UPDATE_IN_PROGRESS) to perform traffic change..' in result.output
+        mocked_time_sleep.assert_called_once_with(5)
+        mocked_change_version_traffic.assert_called_once_with(get_stack_refs(['myapp', 'v1'])[0], 100.0,
+                                                              'aa-fakeregion-1')
+
+    # the creation of the stack failed
+    with _reset_mocks_ctx():
+        result = _run_for_stacks_states_changes(['CREATE_IN_PROGRESS', 'CREATE_FAILED'])
+
+        assert 'Waiting for stack myapp (CREATE_IN_PROGRESS) to perform traffic change..' in result.output
+        mocked_time_sleep.assert_called_once_with(5)
+
+    # test stack ready to change
+    with _reset_mocks_ctx():
+        _run_for_stacks_states_changes(['UPDATE_COMPLETE'])
+
+        mocked_change_version_traffic.assert_called_once_with(get_stack_refs(['myapp', 'v1'])[0], 100.0,
+                                                              'aa-fakeregion-1')
+        mocked_time_sleep.assert_not_called()
+
+    # test target stack is ready, but related ones are not, should wait
+    with _reset_mocks_ctx():
+        _run_for_stacks_states_changes(['CREATE_IN_PROGRESS', 'CREATE_COMPLETE'])
+
+        mocked_change_version_traffic.assert_called_once_with(get_stack_refs(['myapp', 'v1'])[0], 100.0,
+                                                              'aa-fakeregion-1')
+        mocked_time_sleep.assert_called_once_with(5)
+
 
 def test_AccountArguments(monkeypatch):
     senza.traffic.DNS_ZONE_CACHE = {}
@@ -1376,8 +1483,8 @@ def test_AccountArguments(monkeypatch):
     boto3 = MagicMock()
     boto3.list_hosted_zones.return_value = {'HostedZones': [HOSTED_ZONE_EXAMPLE_NET]}
     monkeypatch.setattr('boto3.client', MagicMock(return_value=boto3))
-    monkeypatch.setattr('senza.cli.get_account_alias', MagicMock(return_value='test-cli'))
-    monkeypatch.setattr('senza.cli.get_account_id', MagicMock(return_value='98741256325'))
+    monkeypatch.setattr('senza.definitions.get_account_alias', MagicMock(return_value='test-cli'))
+    monkeypatch.setattr('senza.definitions.get_account_id', MagicMock(return_value='98741256325'))
 
     test = AccountArguments('test-region')
 
@@ -1393,8 +1500,8 @@ def test_patch(monkeypatch):
     boto3.list_stacks.return_value = {'StackSummaries': [{'StackName': 'myapp-1',
                                                           'CreationTime': '2016-06-14'}]}
     boto3.describe_stack_resources.return_value = {'StackResources':
-                                                   [{'ResourceType': 'AWS::AutoScaling::AutoScalingGroup',
-                                                     'PhysicalResourceId': 'myasg'}]}
+                                                       [{'ResourceType': 'AWS::AutoScaling::AutoScalingGroup',
+                                                         'PhysicalResourceId': 'myasg'}]}
     group = {'AutoScalingGroupName': 'myasg'}
     boto3.describe_auto_scaling_groups.return_value = {'AutoScalingGroups': [group]}
     image = MagicMock()
@@ -1431,8 +1538,8 @@ def test_scale(monkeypatch):
     boto3.list_stacks.return_value = {'StackSummaries': [{'StackName': 'myapp-1',
                                                           'CreationTime': '2016-06-14'}]}
     boto3.describe_stack_resources.return_value = {'StackResources':
-                                                   [{'ResourceType': 'AWS::AutoScaling::AutoScalingGroup',
-                                                     'PhysicalResourceId': 'myasg'}]}
+                                                       [{'ResourceType': 'AWS::AutoScaling::AutoScalingGroup',
+                                                         'PhysicalResourceId': 'myasg'}]}
     # NOTE: we are using invalid MinSize (< capacity) here to get one more line covered ;-)
     group = {'AutoScalingGroupName': 'myasg', 'DesiredCapacity': 1, 'MinSize': 3, 'MaxSize': 1}
     boto3.describe_auto_scaling_groups.return_value = {'AutoScalingGroups': [group]}
@@ -1444,7 +1551,6 @@ def test_scale(monkeypatch):
 
 
 def test_wait(monkeypatch):
-
     cf = MagicMock()
     stack1 = {'StackName': 'test-1',
               'CreationTime': datetime.datetime.utcnow(),
@@ -1533,10 +1639,10 @@ def test_wait_failure(monkeypatch):
 
     cf.list_stacks.return_value = {'StackSummaries': [stack1]}
     cf.describe_stack_events.return_value = {'StackEvents':
-                                             [{'Timestamp': 0,
-                                               'ResourceStatus': 'FAIL',
-                                               'ResourceStatusReason': 'myreason',
-                                               'LogicalResourceId': 'foo'}]}
+                                                 [{'Timestamp': 0,
+                                                   'ResourceStatus': 'FAIL',
+                                                   'ResourceStatusReason': 'myreason',
+                                                   'LogicalResourceId': 'foo'}]}
     monkeypatch.setattr('boto3.client', MagicMock(return_value=cf))
 
     def my_resource(rtype, *args):
@@ -1565,8 +1671,7 @@ def test_account_arguments():
     assert test.Region == 'blubber'
 
 
-def test_get_stack_reference():
-
+def test_get_stack_reference(monkeypatch):
     fb_none = StackReference(name='foobar-stack', version=None)
     fb_v1 = StackReference(name='foobar-stack', version='v1')
     fb_v2 = StackReference(name='foobar-stack', version='v2')
@@ -1582,6 +1687,36 @@ def test_get_stack_reference():
     assert get_stack_refs(['foobar-stack', 'v1', 'v2', 'v99',
                            'other-stack']) == [fb_v1, fb_v2, fb_v99,
                                                os_none]
+
+    monkeypatch.setattr('builtins.open',
+                        mock_open(read_data='{"SenzaInfo": '
+                                            '{"StackName": "foobar-stack"}}'))
+    assert get_stack_refs(['test.yaml']) == [fb_none]
+
+    monkeypatch.setattr('builtins.open',
+                        mock_open(read_data='invalid: true'))
+    with pytest.raises(InvalidDefinition) as exc_info1:
+        get_stack_refs(['test.yaml'])
+
+    assert (str(exc_info1.value) == "test.yaml is not a valid "
+                                    "senza definition: SenzaInfo is missing "
+                                    "or invalid")
+
+    monkeypatch.setattr('builtins.open',
+                        mock_open(read_data='{"SenzaInfo": 42}'))
+    with pytest.raises(InvalidDefinition) as exc_info2:
+        get_stack_refs(['test.yaml'])
+
+    assert (str(exc_info2.value) == "test.yaml is not a valid "
+                                    "senza definition: Invalid SenzaInfo")
+
+    monkeypatch.setattr('builtins.open',
+                        mock_open(read_data='"badxml'))
+
+    with pytest.raises(InvalidDefinition) as exc_info3:
+        get_stack_refs(['test.yaml'])
+
+    assert "while scanning a quoted scalar" in str(exc_info3.value)
 
 
 def test_all_with_version():
@@ -1625,7 +1760,7 @@ def test_failure_event():
                           'ResourceStatus': 'FAIL'})
 
 
-def test_status_main_dns(monkeypatch):
+def test_status_main_dns(monkeypatch, disable_version_check):  # noqa: F811
     def my_resource(rtype, *args):
         if rtype == 'ec2':
             ec2 = MagicMock()
@@ -1678,3 +1813,100 @@ def test_status_main_dns(monkeypatch):
 
     data = json.loads(result.output.strip())
     assert data[0]['main_dns'] is True
+
+
+def test_traffic_fallback_route53api(monkeypatch, boto_client, boto_resource):  # noqa: F811
+    stacks = [
+        StackVersion('myapp', 'v1', ['myapp.zo.ne'],
+                     ['some-lb.eu-central-1.elb.amazonaws.com'], ['some-arn']),
+        StackVersion('myapp', 'v2', ['myapp.zo.ne'],
+                     ['another-elb.eu-central-1.elb.amazonaws.com'], ['some-arn']),
+    ]
+    monkeypatch.setattr('senza.traffic.get_stack_versions',
+                        MagicMock(return_value=stacks))
+
+    referenced_stacks = [
+        SenzaStackSummary({'StackName': s.name, 'StackStatus': 'UPDATE_COMPLETE'})
+        for s in stacks
+        ]
+    monkeypatch.setattr('senza.cli.get_stacks', MagicMock(name="fake_get_stacks", return_value=referenced_stacks))
+
+    def _record(dns_identifier, weight):
+        return Route53Record(name='myapp.zo.ne.',
+                             type=RecordType.A,
+                             weight=weight,
+                             set_identifier=dns_identifier)
+
+    rr = MagicMock()
+    records = collections.OrderedDict()
+
+    # scenario: v1 DNS record was manually updated to 100% (not via CF)
+    for ver, percentage in [('v1', 100),
+                            ('v2', 0)]:
+        dns_identifier = 'myapp-{}'.format(ver)
+        records[dns_identifier] = _record(dns_identifier,
+                                          percentage * PERCENT_RESOLUTION)
+
+    rr.__iter__ = lambda x: iter(records.values())
+    monkeypatch.setattr('senza.traffic.Route53.get_records',
+                        MagicMock(return_value=rr))
+
+    def _change_rr_set(HostedZoneId, ChangeBatch):
+        for change in ChangeBatch['Changes']:
+            action = change['Action']
+            rrset = change['ResourceRecordSet']
+            assert action == 'UPSERT'
+            records[rrset['SetIdentifier']] = Route53Record.from_boto_dict(rrset)
+
+    boto_client['route53'].change_resource_record_sets = _change_rr_set
+
+    runner = CliRunner()
+
+    common_opts = ['traffic', '--region=aa-fakeregion-1', 'myapp']
+
+    def _run(opts):
+        result = runner.invoke(cli, common_opts + opts, catch_exceptions=False)
+        assert 'Setting weights for myapp.zo.ne..' in result.output
+        return result
+
+    m_cfs = MagicMock()
+    m_stacks = collections.defaultdict(MagicMock)
+
+    def _get_stack(name, region):
+        if name not in m_stacks:
+            stack = m_stacks[name]
+            stack.template = {'Resources': {
+                'MyMainDomain': {
+                    'Type': 'AWS::Route53::RecordSet',
+                    'Properties': {'Weight': 999,  # does not matter
+                                   'Name': 'myapp.zo.ne.'}
+                }
+            }}
+            if name == 'myapp-v1':
+                # CF will say "no need to update" as v1 was not updated via CF
+                stack.update.side_effect = StackNotUpdated('app-v1 record was manipulated through Route53 API')
+        return m_stacks[name]
+
+    m_cfs.get_by_stack_name = _get_stack
+
+    def _get_weight(stack):
+        return stack.template['Resources']['MyMainDomain']['Properties']['Weight']
+
+    monkeypatch.setattr('senza.traffic.CloudFormationStack', m_cfs)
+
+    with runner.isolated_filesystem():
+        _run(['v2', '100'])
+        # check that template resource weights were updated..
+        assert _get_weight(m_stacks['myapp-v1']) == 0
+        assert _get_weight(m_stacks['myapp-v2']) == 200
+        # IMPORTANT: DNS record of v1 must have been updated!
+        assert records['myapp-v1'].weight == 0
+        # we won't check v2 as it was not manipulated (only via CF)
+
+
+def test_create_cf_template_compact_json(monkeypatch):
+    monkeypatch.setattr('boto3.client', MagicMock())
+    definition = {'SenzaInfo': {'StackName': 'foo-compact-json'}}
+    cf_template = create_cf_template(definition, 'aa-fakeregion-1', '1', [], False, None)
+    # verify that we are using the "compressed" JSON format (no indentation, no extra whitespace)
+    assert '"Senza":{"Info":' in cf_template['TemplateBody']

@@ -4,27 +4,34 @@ import click
 import pierone.api
 import pytest
 import senza.traffic
-from senza.cli import AccountArguments
+from senza.definitions import AccountArguments
 from senza.components import get_component
+from senza.components.configuration import component_configuration
 from senza.components.auto_scaling_group import (component_auto_scaling_group,
                                                  normalize_asg_success,
                                                  normalize_network_threshold,
                                                  to_iso8601_duration)
+from senza.components.coreos_auto_configuration import component_coreos_auto_configuration
 from senza.components.elastic_load_balancer import (component_elastic_load_balancer,
                                                     get_load_balancer_name)
+from senza.components.elastic_load_balancer_v2 import component_elastic_load_balancer_v2
 from senza.components.iam_role import component_iam_role, get_merged_policies
 from senza.components.redis_cluster import component_redis_cluster
 from senza.components.redis_node import component_redis_node
 from senza.components.stups_auto_configuration import \
     component_stups_auto_configuration
+from senza.components.subnet_auto_configuration import component_subnet_auto_configuration
 from senza.components.taupage_auto_scaling_group import (check_application_id,
                                                          check_application_version,
                                                          check_docker_image_exists,
                                                          generate_user_data)
 from senza.components.weighted_dns_elastic_load_balancer import \
     component_weighted_dns_elastic_load_balancer
+from senza.components.weighted_dns_elastic_load_balancer_v2 import \
+    component_weighted_dns_elastic_load_balancer_v2
 
-from fixtures import HOSTED_ZONE_ZO_NE_COM, HOSTED_ZONE_ZO_NE_DEV, boto_resource
+from fixtures import (HOSTED_ZONE_ZO_NE_COM, HOSTED_ZONE_ZO_NE_DEV,  # noqa: F401
+                      boto_resource, boto_client)
 
 
 def test_invalid_component():
@@ -136,12 +143,47 @@ def test_component_load_balancer_idletimeout(monkeypatch):
     assert 'HTTPPort' not in result["Resources"]["test_lb"]["Properties"]
 
 
+def test_component_load_balancer_cert_arn(monkeypatch):
+    configuration = {
+        "Name": "test_lb",
+        "SecurityGroups": "",
+        "HTTPPort": "9999",
+        "SSLCertificateId": "foo2"
+    }
+
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    mock_string_result = MagicMock()
+    mock_string_result.return_value = "foo"
+    monkeypatch.setattr('senza.components.elastic_load_balancer.resolve_security_groups', mock_string_result)
+
+    m_acm = MagicMock()
+    m_acm_certificate = MagicMock()
+    m_acm_certificate.arn = "foo"
+
+    m_acm.get_certificates.return_value = iter([m_acm_certificate])
+
+    m_acm_certificate.is_arn_certificate.return_value = True
+    m_acm_certificate.get_by_arn.return_value = True
+
+    monkeypatch.setattr('senza.components.elastic_load_balancer.ACM', m_acm)
+    monkeypatch.setattr('senza.components.elastic_load_balancer.ACMCertificate', m_acm_certificate)
+
+    # issue 105: support additional ELB properties
+    result = component_elastic_load_balancer(definition, configuration, args, info, False, MagicMock())
+    assert "foo2" == result["Resources"]["test_lb"]["Properties"]["Listeners"][0]["SSLCertificateId"]
+
+
 def test_component_load_balancer_http_only(monkeypatch):
     configuration = {
         "Name": "test_lb",
         "SecurityGroups": "",
         "HTTPPort": "9999",
-        "SSLCertificateId": "arn:none", # should be ignored as we overwrite Listeners
+        "SSLCertificateId": "arn:none",  # should be ignored as we overwrite Listeners
         "Listeners": [{"Foo": "Bar"}]
     }
     info = {'StackName': 'foobar', 'StackVersion': '0.1'}
@@ -156,6 +198,31 @@ def test_component_load_balancer_http_only(monkeypatch):
 
     result = component_elastic_load_balancer(definition, configuration, args, info, False, MagicMock())
     assert 'Bar' == result["Resources"]["test_lb"]["Properties"]["Listeners"][0]["Foo"]
+
+
+def test_component_load_balancer_listeners_ssl(monkeypatch):
+    configuration = {
+        "Name": "test_lb",
+        "SecurityGroups": "",
+        "HTTPPort": "9999",
+        "Listeners": [{"Protocol": "SSL"}]
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    mock_string_result = MagicMock()
+    mock_string_result.return_value = "foo"
+    monkeypatch.setattr('senza.components.elastic_load_balancer.resolve_security_groups', mock_string_result)
+
+    get_ssl_cert = MagicMock()
+    get_ssl_cert.return_value = 'my-ssl-arn'
+    monkeypatch.setattr('senza.components.elastic_load_balancer.get_ssl_cert', get_ssl_cert)
+
+    result = component_elastic_load_balancer(definition, configuration, args, info, False, MagicMock())
+    assert 'my-ssl-arn' == result["Resources"]["test_lb"]["Properties"]["Listeners"][0]["SSLCertificateId"]
 
 
 def test_component_load_balancer_namelength(monkeypatch):
@@ -242,9 +309,11 @@ def test_component_stups_auto_configuration_vpc_id(monkeypatch):
     sn3.tags = [{'Key': 'Name', 'Value': 'internal-3'}]
     sn3.availability_zone = 'az-1'
     ec2 = MagicMock()
+
     def get_subnets(Filters):
         assert Filters == [{'Name': 'vpc-id', 'Values': ['vpc-123']}]
         return [sn1, sn2, sn3]
+
     ec2.subnets.filter = get_subnets
     image = MagicMock()
     ec2.images.filter.return_value = [image]
@@ -311,7 +380,7 @@ def test_component_redis_cluster(monkeypatch):
     assert 'RedisReplicationGroup' in result['Resources']
     assert mock_string == result['Resources']['RedisReplicationGroup']['Properties']['SecurityGroupIds']
     assert 2 == result['Resources']['RedisReplicationGroup']['Properties']['NumCacheClusters']
-    assert True == result['Resources']['RedisReplicationGroup']['Properties']['AutomaticFailoverEnabled']
+    assert result['Resources']['RedisReplicationGroup']['Properties']['AutomaticFailoverEnabled']
     assert 'Engine' in result['Resources']['RedisReplicationGroup']['Properties']
     assert 'EngineVersion' in result['Resources']['RedisReplicationGroup']['Properties']
     assert 'CacheNodeType' in result['Resources']['RedisReplicationGroup']['Properties']
@@ -322,26 +391,15 @@ def test_component_redis_cluster(monkeypatch):
     assert 'SubnetIds' in result['Resources']['RedisSubnetGroup']['Properties']
 
 
-def test_weighted_dns_load_balancer(monkeypatch, boto_resource):
+def test_weighted_dns_load_balancer(monkeypatch, boto_client, boto_resource):  # noqa: F811
     senza.traffic.DNS_ZONE_CACHE = {}
-
-    def my_client(rtype, *args):
-        if rtype == 'route53':
-            route53 = MagicMock()
-            route53.list_hosted_zones.return_value = {'HostedZones': [HOSTED_ZONE_ZO_NE_COM],
-                                                      'IsTruncated': False,
-                                                      'MaxItems': '100'}
-            return route53
-        return MagicMock()
-
-    monkeypatch.setattr('boto3.client', my_client)
 
     configuration = {
         "Name": "test_lb",
         "SecurityGroups": "",
         "HTTPPort": "9999",
-        'MainDomain': 'great.api.zo.ne.com',
-        'VersionDomain': 'version.api.zo.ne.com'
+        'MainDomain': 'great.api.zo.ne',
+        'VersionDomain': 'version.api.zo.ne'
     }
     info = {'StackName': 'foobar', 'StackVersion': '0.1'}
     definition = {"Resources": {}}
@@ -369,20 +427,16 @@ def test_weighted_dns_load_balancer(monkeypatch, boto_resource):
     assert 'MainDomain' not in result["Resources"]["test_lb"]["Properties"]
 
 
-def test_weighted_dns_load_balancer_with_different_domains(monkeypatch, boto_resource):
+def test_weighted_dns_load_balancer_with_different_domains(monkeypatch,  # noqa: F811
+                                                           boto_client,
+                                                           boto_resource):
     senza.traffic.DNS_ZONE_CACHE = {}
 
-    def my_client(rtype, *args):
-        if rtype == 'route53':
-            route53 = MagicMock()
-            route53.list_hosted_zones.return_value = {'HostedZones': [HOSTED_ZONE_ZO_NE_DEV,
-                                                                      HOSTED_ZONE_ZO_NE_COM],
-                                                      'IsTruncated': False,
-                                                      'MaxItems': '100'}
-            return route53
-        return MagicMock()
-
-    monkeypatch.setattr('boto3.client', my_client)
+    boto_client['route53'].list_hosted_zones.return_value = {
+        'HostedZones': [HOSTED_ZONE_ZO_NE_DEV,
+                        HOSTED_ZONE_ZO_NE_COM],
+        'IsTruncated': False,
+        'MaxItems': '100'}
 
     configuration = {
         "Name": "test_lb",
@@ -487,6 +541,7 @@ def test_component_auto_scaling_group_configurable_properties():
         'Name': 'Foo',
         'InstanceType': 't2.micro',
         'Image': 'foo',
+        'MetricsCollection': {'Granularity': '1Minute'},
         'AutoScaling': {
             'Minimum': 2,
             'Maximum': 10,
@@ -496,7 +551,10 @@ def test_component_auto_scaling_group_configurable_properties():
             'ScaleUpThreshold': 50,
             'ScaleDownThreshold': 20,
             'EvaluationPeriods': 1,
+            'ScalingAdjustment': 1,
+            'ScaleUpAdjustment': 3,
             'Cooldown': 30,
+            'ScaleDownCooldown': 360,
             'Statistic': 'Maximum'
         }
     }
@@ -513,12 +571,12 @@ def test_component_auto_scaling_group_configurable_properties():
 
     assert result["Resources"]["FooScaleUp"] is not None
     assert result["Resources"]["FooScaleUp"]["Properties"] is not None
-    assert result["Resources"]["FooScaleUp"]["Properties"]["ScalingAdjustment"] == "1"
+    assert result["Resources"]["FooScaleUp"]["Properties"]["ScalingAdjustment"] == "3"
     assert result["Resources"]["FooScaleUp"]["Properties"]["Cooldown"] == "30"
 
     assert result["Resources"]["FooScaleDown"] is not None
     assert result["Resources"]["FooScaleDown"]["Properties"] is not None
-    assert result["Resources"]["FooScaleDown"]["Properties"]["Cooldown"] == "30"
+    assert result["Resources"]["FooScaleDown"]["Properties"]["Cooldown"] == "360"
     assert result["Resources"]["FooScaleDown"]["Properties"]["ScalingAdjustment"] == "-1"
 
     assert result["Resources"]["Foo"] is not None
@@ -533,6 +591,7 @@ def test_component_auto_scaling_group_configurable_properties():
     assert result["Resources"]["Foo"]["Properties"]["MinSize"] == 2
     assert result["Resources"]["Foo"]["Properties"]["DesiredCapacity"] == 2
     assert result["Resources"]["Foo"]["Properties"]["MaxSize"] == 10
+    assert result['Resources']['Foo']['Properties']['MetricsCollection'] == {'Granularity': '1Minute'}
 
     expected_desc = "Scale-down if CPU < 20% for 1.0 minutes (Maximum)"
     assert result["Resources"]["FooCPUAlarmHigh"]["Properties"]["Statistic"] == "Maximum"
@@ -540,15 +599,16 @@ def test_component_auto_scaling_group_configurable_properties():
     assert result["Resources"]["FooCPUAlarmHigh"]["Properties"]["EvaluationPeriods"] == "1"
     assert result["Resources"]["FooCPUAlarmLow"]["Properties"]["AlarmDescription"] == expected_desc
 
+
 def test_component_auto_scaling_group_custom_tags():
     definition = {"Resources": {}}
     configuration = {
         'Name': 'Foo',
         'InstanceType': 't2.micro',
         'Image': 'foo',
-        'Tags': [ 
-            { 'Key': 'Tag1', 'Value': 'alpha' },
-            { 'Key': 'Tag2', 'Value': 'beta' }
+        'Tags': [
+            {'Key': 'Tag1', 'Value': 'alpha'},
+            {'Key': 'Tag2', 'Value': 'beta'}
         ]
     }
 
@@ -577,7 +637,8 @@ def test_component_auto_scaling_group_custom_tags():
     assert ts is not None
     assert ts["Value"] == 'FooStack-FooVersion'
 
-def test_component_auto_scaling_group_configurable_properties():
+
+def test_component_auto_scaling_group_configurable_properties2():
     definition = {"Resources": {}}
     configuration = {
         'Name': 'Foo',
@@ -867,3 +928,196 @@ def test_get_load_balancer_name():
 
     get_load_balancer_name('toolong123456789012345678901234567890',
                            '1') == 'toolong12345678901234567890123-1'
+
+
+def test_weighted_dns_load_balancer_v2(monkeypatch, boto_client, boto_resource):  # noqa: F811
+    senza.traffic.DNS_ZONE_CACHE = {}
+
+    configuration = {
+        "Name": "MyLB",
+        "SecurityGroups": "",
+        "HTTPPort": "9999",
+        'MainDomain': 'great.api.zo.ne',
+        'VersionDomain': 'version.api.zo.ne',
+        # test overwritting specific properties in one of the resources
+        'TargetGroupAttributes': [{'Key': 'deregistration_delay.timeout_seconds', 'Value': '123'}],
+        # test that Security Groups are resolved
+        'SecurityGroups': ['foo-security-group']
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    mock_string_result = MagicMock()
+    mock_string_result.return_value = ['sg-foo']
+    monkeypatch.setattr('senza.components.elastic_load_balancer_v2.resolve_security_groups', mock_string_result)
+
+    get_ssl_cert = MagicMock()
+    get_ssl_cert.return_value = 'arn:aws:42'
+    monkeypatch.setattr('senza.components.elastic_load_balancer_v2.get_ssl_cert', get_ssl_cert)
+
+    result = component_weighted_dns_elastic_load_balancer_v2(definition,
+                                                             configuration,
+                                                             args,
+                                                             info,
+                                                             False,
+                                                             AccountArguments('dummyregion'))
+
+    assert 'MyLB' in result["Resources"]
+    assert 'MyLBListener' in result["Resources"]
+    assert 'MyLBTargetGroup' in result["Resources"]
+
+    target_group = result['Resources']['MyLBTargetGroup']
+    lb_listener = result['Resources']['MyLBListener']
+
+    assert target_group['Properties']['HealthCheckPort'] == '9999'
+    assert lb_listener['Properties']['Certificates'] == [
+        {'CertificateArn': 'arn:aws:42'}
+    ]
+    # test that our custom drain setting works
+    assert target_group['Properties']['TargetGroupAttributes'] == [
+        {'Key': 'deregistration_delay.timeout_seconds',
+         'Value': '123'}
+    ]
+    assert result['Resources']['MyLB']['Properties']['SecurityGroups'] == ['sg-foo']
+
+
+def test_max_description_length():
+    definition = {}
+    configuration = {}
+    args = MagicMock()
+    args.__dict__ = {'Param1': 'my param value', 'SecondParam': ('1234567890' * 100)}
+    info = {'StackName': 'My-Stack'}
+    component_configuration(definition, configuration, args, info, False, AccountArguments('dummyregion'))
+    assert definition['Description'].startswith('My Stack (Param1: my param value, SecondParam: 1234567890')
+    assert 0 < len(definition['Description']) <= 1024
+
+
+def test_template_parameters():
+    definition = {}
+    configuration = {'DefineParameters': False}
+    args = MagicMock()
+    args.__dict__ = {'Param1': 'my param value', 'SecondParam': ('1234567890' * 100)}
+    info = {'StackName': 'My-Stack', 'Parameters': []}
+    component_configuration(definition, configuration, args, info, False, AccountArguments('dummyregion'))
+    assert definition.get('Parameters') == None
+
+
+def test_component_load_balancer_default_internal_scheme(monkeypatch):
+    configuration = {
+        "Name": "test_lb",
+        "SecurityGroups": "",
+        "HTTPPort": "9999"
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    mock_string_result = MagicMock()
+    mock_string_result.return_value = "foo"
+    monkeypatch.setattr('senza.components.elastic_load_balancer.resolve_security_groups', mock_string_result)
+
+    result = component_elastic_load_balancer(definition, configuration, args, info, False, MagicMock())
+    assert 'internal' == result["Resources"]["test_lb"]["Properties"]["Scheme"]
+
+
+def test_component_load_balancer_v2_default_internal_scheme(monkeypatch):
+    configuration = {
+        "Name": "test_lb",
+        "SecurityGroups": "",
+        "HTTPPort": "9999"
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    mock_string_result = MagicMock()
+    mock_string_result.return_value = "foo"
+    monkeypatch.setattr('senza.components.elastic_load_balancer_v2.resolve_security_groups', mock_string_result)
+
+    result = component_elastic_load_balancer_v2(definition, configuration, args, info, False, MagicMock())
+    assert 'internal' == result["Resources"]["test_lb"]["Properties"]["Scheme"]
+
+
+def test_component_load_balancer_v2_target_group_vpc_id(monkeypatch):
+    configuration = {
+        "Name": "test_lb",
+        "SecurityGroups": "",
+        "HTTPPort": "9999",
+        "VpcId": "0a-12345"
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    mock_string_result = MagicMock()
+    mock_string_result.return_value = "foo"
+    monkeypatch.setattr('senza.components.elastic_load_balancer_v2.resolve_security_groups', mock_string_result)
+
+    result = component_elastic_load_balancer_v2(definition, configuration, args, info, False, MagicMock())
+    assert '0a-12345' == result["Resources"]["test_lbTargetGroup"]["Properties"]["VpcId"]
+
+
+def test_component_subnet_auto_configuration(monkeypatch):
+    configuration = {
+        'PublicOnly': True,
+        'VpcId': 'vpc-123'
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    subnet1 = MagicMock()
+    subnet1.id = 'subnet-1'
+    subnet2 = MagicMock()
+    subnet2.id = 'subnet-2'
+
+    ec2 = MagicMock()
+    ec2.subnets.filter.return_value = [subnet1, subnet2]
+    monkeypatch.setattr('boto3.resource', lambda *args: ec2)
+
+    result = component_subnet_auto_configuration(definition, configuration, args, info, False, MagicMock())
+    assert ['subnet-1', 'subnet-2'] == result['Mappings']['ServerSubnets']['foo']['Subnets']
+
+    configuration = {
+        'PublicOnly': False,
+        'VpcId': 'vpc-123'
+    }
+    result = component_subnet_auto_configuration(definition, configuration, args, info, False, MagicMock())
+    assert ['subnet-1', 'subnet-2'] == result['Mappings']['ServerSubnets']['foo']['Subnets']
+
+
+def test_component_coreos_auto_configuration(monkeypatch):
+    configuration = {
+        'ReleaseChannel': 'gamma'
+    }
+    info = {'StackName': 'foobar', 'StackVersion': '0.1'}
+    definition = {"Resources": {}}
+
+    args = MagicMock()
+    args.region = "foo"
+
+    subnet1 = MagicMock()
+    subnet1.id = 'subnet-1'
+
+    ec2 = MagicMock()
+    ec2.subnets.filter.return_value = [subnet1]
+
+    get = MagicMock()
+    get.return_value.json.return_value = {'foo': {'hvm': 'ami-007'}}
+
+    monkeypatch.setattr('boto3.resource', lambda *args: ec2)
+    monkeypatch.setattr('requests.get', get)
+    result = component_coreos_auto_configuration(definition, configuration, args, info, False, MagicMock())
+    assert 'ami-007' == result['Mappings']['Images']['foo']['LatestCoreOSImage']
+

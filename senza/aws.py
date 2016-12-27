@@ -1,20 +1,23 @@
 import base64
-import boto3
 import collections
 import datetime
 import functools
 import re
 import time
+
+import boto3
 import yaml
 from botocore.exceptions import ClientError
 from click import FileError
 
+from .manaus.boto_proxy import BotoClientProxy
+from .manaus.utils import extract_client_error_code
 from .stack_references import check_file_exceptions
 
 
 def resolve_referenced_resource(ref: dict, region: str):
     if 'Stack' in ref and 'LogicalId' in ref:
-        cf = boto3.client('cloudformation', region)
+        cf = BotoClientProxy('cloudformation', region)
         resource = cf.describe_stack_resource(
             StackName=ref['Stack'],
             LogicalResourceId=ref['LogicalId'])['StackResourceDetail']
@@ -30,7 +33,7 @@ def resolve_referenced_resource(ref: dict, region: str):
         else:
             return resource_id
     elif 'Stack' in ref and 'Output' in ref:
-        cf = boto3.client('cloudformation', region)
+        cf = BotoClientProxy('cloudformation', region)
         stack = cf.describe_stacks(
             StackName=ref['Stack'])['Stacks'][0]
         if not is_status_complete(stack['StackStatus']):
@@ -52,17 +55,17 @@ def is_status_complete(status: str):
 def get_security_group(region: str, sg_name: str):
     ec2 = boto3.resource('ec2', region)
     try:
-        sec_groups = list(ec2.security_groups.filter(
-            Filters=[{'Name': 'group-name', 'Values': [sg_name]}]
-        ))
-        if not sec_groups:
-            return None
-        # FIXME: What if we have 2 VPC, with a SG with the same name?!
-        return sec_groups[0]
+        # first try by tag name then by group-name (cannot be changed)
+        for _filter in [{'Name': 'tag:Name', 'Values': [sg_name]}, {'Name': 'group-name', 'Values': [sg_name]}]:
+            sec_groups = list(ec2.security_groups.filter(Filters=[_filter]))
+            if sec_groups:
+                # FIXME: What if we have 2 VPC, with a SG with the same name?!
+                return sec_groups[0]
     except ClientError as e:
-        if e.response['Error']['Code'] == 'InvalidGroup.NotFound':
+        error_code = extract_client_error_code(e)
+        if error_code == 'InvalidGroup.NotFound':
             return None
-        elif e.response['Error']['Code'] == 'VPCIdNotSpecified':
+        elif error_code == 'VPCIdNotSpecified':
             # no Default VPC, we must use the lng way...
             for sg in ec2.security_groups.all():
                 # FIXME: What if we have 2 VPC, with a SG with the same name?!
@@ -81,7 +84,7 @@ def get_vpc_attribute(region: str, vpc_id: str, attribute: str):
 
 
 def encrypt(region: str, KeyId: str, Plaintext: str, b64encode=False):
-    kms = boto3.client('kms', region)
+    kms = BotoClientProxy('kms', region)
     encrypted = kms.encrypt(KeyId=KeyId, Plaintext=Plaintext)['CiphertextBlob']
     if b64encode:
         return base64.b64encode(encrypted).decode('utf-8')
@@ -90,7 +93,7 @@ def encrypt(region: str, KeyId: str, Plaintext: str, b64encode=False):
 
 
 def list_kms_keys(region: str, details=True):
-    kms = boto3.client('kms', region)
+    kms = BotoClientProxy('kms', region)
     keys = list(kms.list_keys()['Keys'])
     if details:
         aliases = kms.list_aliases()['Aliases']
@@ -146,7 +149,10 @@ def get_required_capabilities(data: dict):
     capabilities = []
     for logical_id, config in data.get('Resources', {}).items():
         if config.get('Type').startswith('AWS::IAM'):
-            capabilities.append('CAPABILITY_IAM')
+            if config.get('Properties', {}).get('RoleName'):
+                capabilities.append('CAPABILITY_NAMED_IAM')
+            else:
+                capabilities.append('CAPABILITY_IAM')
     return capabilities
 
 
@@ -191,7 +197,7 @@ class SenzaStackSummary:
 
 def get_stacks(stack_refs: list, region, all=False, unique_only=False):
     # boto3.resource('cf')-stacks.filter() doesn't support status_filter, only StackName
-    cf = boto3.client('cloudformation', region)
+    cf = BotoClientProxy('cloudformation', region)
     if all:
         status_filter = []
     else:
@@ -262,7 +268,7 @@ def get_tag(tags: list, key: str, default=None):
 
 
 def get_account_id():
-    conn = boto3.client('iam')
+    conn = BotoClientProxy('iam')
     try:
         own_user = conn.get_user()['User']
     except:
@@ -288,7 +294,7 @@ def get_account_id():
 
 
 def get_account_alias():
-    conn = boto3.client('iam')
+    conn = BotoClientProxy('iam')
     return conn.list_account_aliases()['AccountAliases'][0]
 
 
@@ -307,9 +313,9 @@ class StackReference(collections.namedtuple('StackReference', 'name version')):
             try:
                 with open(self.name) as fd:
                     data = yaml.safe_load(fd)
-                ref = data['SenzaInfo']['StackName']
+                assert data['SenzaInfo']['StackName']
             except (OSError, IOError) as error:
-                raise FileError(ref, str(error))
+                raise FileError(self.name, error.strerror)
             except KeyError as error:
                 raise ValueError("SenzaInfo.StackName missing from definition file")
 
