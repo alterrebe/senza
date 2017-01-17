@@ -6,7 +6,7 @@ integration
 import sys
 from tempfile import NamedTemporaryFile
 from traceback import format_exception
-from typing import Any, Dict, Optional  # noqa: F401
+from typing import Optional  # noqa: F401
 
 import senza
 import yaml.constructor
@@ -15,7 +15,8 @@ from clickclick import fatal_error
 from raven import Client
 
 from .configuration import configuration
-from .exceptions import InvalidDefinition, PiuNotFound
+from .exceptions import (InvalidDefinition, InvalidUserDataType,
+                         PiuNotFound, SecurityGroupNotFound)
 from .manaus.exceptions import (ELBNotFound, HostedZoneNotFound, InvalidState,
                                 RecordNotFound)
 from .manaus.utils import extract_client_error_code
@@ -112,7 +113,7 @@ class HandleExceptions:
             sys.stdout.flush()
             if is_credentials_expired_error(client_error):
                 die_fatal_error('AWS credentials have expired.\n'
-                                'Use the "mai" command line tool to get a new '
+                                'Use the "zaws" command line tool to get a new '
                                 'temporary access key.')
             elif is_access_denied_error(client_error):
                 die_fatal_error(
@@ -134,9 +135,13 @@ class HandleExceptions:
                 "{}\nYou can install piu with the following command:"
                 "\nsudo pip3 install --upgrade stups-piu".format(error))
         except (ELBNotFound, HostedZoneNotFound, RecordNotFound,
-                InvalidDefinition, InvalidState) as error:
+                InvalidDefinition, InvalidState, InvalidUserDataType) as error:
             die_fatal_error(error)
-        except Exception as unknown_exception:
+        except SecurityGroupNotFound as error:
+            message = ("{}\nRun `senza init` to (re-)create "
+                       "the security group.").format(error)
+            die_fatal_error(message)
+        except Exception as unknown_exception:  # pylint: disable=locally-disabled, broad-except
             # Catch All
             self.die_unknown_error(unknown_exception)
 
@@ -155,4 +160,4 @@ def setup_sentry(sentry_endpoint: Optional[str]):
     return sentry_client
 
 
-sentry = setup_sentry(configuration.get('sentry.endpoint'))
+sentry = setup_sentry(configuration.get('sentry.endpoint'))  # pylint: disable=locally-disabled, invalid-name
